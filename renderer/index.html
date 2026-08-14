@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: file:; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+  <title>DeepSeek Harness</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --line: #30363d;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --accent: #4f8cff;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --err: #f85149;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      background: radial-gradient(1200px 700px at 50% -10%, #16233b 0%, var(--bg) 55%);
+      color: var(--fg);
+      font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      user-select: none; overflow: hidden;
+    }
+    .card {
+      width: 520px; max-width: calc(100vw - 48px);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 40px 36px 28px;
+      box-shadow: 0 24px 80px rgba(0,0,0,.45);
+    }
+    .logo {
+      width: 96px; height: 96px; border-radius: 22px;
+      object-fit: cover; margin: 0 auto 22px; display: block;
+      box-shadow: 0 8px 28px rgba(0,0,0,.5);
+      border: 1px solid var(--line);
+    }
+    h1 { font-size: 20px; text-align: center; letter-spacing: .5px; }
+    .sub { color: var(--muted); text-align: center; font-size: 13px; margin-top: 6px; }
+    .status { margin-top: 24px; min-height: 22px; color: var(--fg); font-size: 14px; display: flex; align-items: center; gap: 8px; }
+    .spinner {
+      width: 14px; height: 14px; border-radius: 50%;
+      border: 2px solid var(--line); border-top-color: var(--accent);
+      animation: spin .8s linear infinite; flex: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .bar { margin-top: 12px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+    .bar > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), #7ab0ff); border-radius: 3px; transition: width .3s ease; }
+    .pct { color: var(--muted); font-size: 12px; margin-top: 6px; text-align: right; }
+    details.logbox { margin-top: 18px; }
+    details.logbox summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+    #log {
+      margin-top: 8px; height: 132px; overflow: auto;
+      background: #0a0d12; border: 1px solid var(--line); border-radius: 8px;
+      padding: 10px; font: 11px/1.6 Consolas, "Courier New", monospace;
+      color: var(--muted); white-space: pre-wrap; word-break: break-all;
+      user-select: text;
+    }
+    .actions { margin-top: 22px; display: flex; gap: 10px; justify-content: center; }
+    button {
+      background: var(--accent); color: #fff; border: none; border-radius: 8px;
+      padding: 9px 20px; font-size: 13px; cursor: pointer;
+    }
+    button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+    button:hover { filter: brightness(1.1); }
+    .hidden { display: none !important; }
+    .ok { color: var(--ok); }
+    .err { color: var(--err); }
+    .warn { color: var(--warn); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <img class="logo" id="logo" src="../assets/icon.png" alt="DeepSeek Harness" />
+    <h1>DeepSeek Harness</h1>
+    <div class="sub">Windows 客户端 · 自动检测 / 安装 / 启动</div>
+
+    <div class="status" id="status">
+      <span class="spinner" id="spinner"></span>
+      <span id="statusText">正在检测环境…</span>
+    </div>
+    <div class="bar"><i id="barFill"></i></div>
+    <div class="pct" id="pct"></div>
+
+    <details class="logbox">
+      <summary>查看详细日志</summary>
+      <div id="log"></div>
+    </details>
+
+    <div class="actions">
+      <button id="retryBtn" class="hidden">重试</button>
+      <button id="browserBtn" class="ghost hidden">在浏览器中打开</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: file:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src http://127.0.0.1:3080 http://localhost:3080;" />
+  <title>设置 - DeepSeek Harness</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --panel2: #1c2129;
+      --line: #30363d;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --accent: #4f8cff;
+      --ok: #3fb950;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+      padding-top: 36px; /* 自定义标题栏 */
+      overflow: hidden;
+      user-select: none;
+    }
+    .layout { display: flex; height: 100%; }
+
+    /* 左侧 tab 栏 */
+    .side {
+      width: 220px; flex: none;
+      background: var(--panel);
+      border-right: 1px solid var(--line);
+      display: flex; flex-direction: column;
+      padding: 16px 10px;
+      gap: 4px;
+    }
+    .side-title {
+      font-size: 13px; color: var(--muted);
+      padding: 0 10px 10px; letter-spacing: 1px;
+    }
+    .tab {
+      display: flex; align-items: center; gap: 9px;
+      width: 100%; text-align: left;
+      background: transparent; border: none;
+      color: var(--fg);
+      padding: 9px 12px;
+      border-radius: 8px;
+      font-size: 14px; cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    .tab:hover { background: rgba(255,255,255,0.06); }
+    .tab.active { background: rgba(79,140,255,0.14); color: #9cc0ff; }
+    .tab .ico { width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; }
+    .side-foot { margin-top: auto; }
+    #backBtn {
+      width: 100%; background: transparent; border: 1px solid var(--line);
+      color: var(--muted); border-radius: 8px; padding: 9px 12px;
+      font-size: 13px; cursor: pointer; transition: all 0.15s ease;
+    }
+    #backBtn:hover { color: var(--fg); border-color: var(--accent); }
+
+    /* 右侧内容区 */
+    .content { flex: 1; overflow: hidden; position: relative; }
+    .panel { position: absolute; inset: 0; display: none; flex-direction: column; }
+    .panel.active { display: flex; }
+    .panel-head {
+      padding: 18px 24px 12px; border-bottom: 1px solid var(--line);
+      display: flex; align-items: baseline; gap: 10px;
+    }
+    .panel-head h2 { font-size: 17px; font-weight: 600; }
+    .panel-head .hint { font-size: 12px; color: var(--muted); }
+    .panel-body { padding: 20px 24px; overflow-y: auto; flex: 1; }
+
+    /* 开关行 */
+    .row {
+      display: flex; align-items: center; justify-content: space-between;
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: 10px; padding: 14px 16px; margin-bottom: 12px;
+      max-width: 640px;
+    }
+    .row .label { font-size: 14px; }
+    .row .desc { font-size: 12px; color: var(--muted); margin-top: 3px; }
+    .switch { position: relative; width: 42px; height: 24px; flex: none; margin-left: 16px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch .slider {
+      position: absolute; inset: 0; cursor: pointer;
+      background: var(--line); border-radius: 24px;
+      transition: background 0.2s ease;
+    }
+    .switch .slider::before {
+      content: ""; position: absolute; height: 18px; width: 18px;
+      left: 3px; top: 3px; background: #fff; border-radius: 50%;
+      transition: transform 0.2s ease;
+    }
+    .switch input:checked + .slider { background: var(--accent); }
+    .switch input:checked + .slider::before { transform: translateX(18px); }
+
+    /* 个性化 */
+    .instr-path { font-size: 12px; color: var(--muted); margin-bottom: 10px; user-select: text; }
+    #instrTextarea {
+      width: 100%; height: 340px; resize: vertical;
+      background: var(--panel); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 10px;
+      padding: 12px; font: 13px/1.6 Consolas, "Microsoft YaHei UI", monospace;
+      outline: none; user-select: text;
+    }
+    #instrTextarea:focus { border-color: var(--accent); }
+    .save-row { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
+    #saveBtn {
+      background: var(--accent); color: #fff; border: none;
+      border-radius: 8px; padding: 9px 22px; font-size: 14px; cursor: pointer;
+      transition: filter 0.15s ease;
+    }
+    #saveBtn:hover { filter: brightness(1.12); }
+    #saveStatus { font-size: 13px; color: var(--ok); }
+
+    /* 网页设置 iframe */
+    #tab-web.panel { padding: 0; }
+    #webFrame { width: 100%; height: 100%; border: none; background: #fff; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="side">
+      <div class="side-title">设置</div>
+      <nav>
+        <button class="tab active" data-tab="system">
+          <span class="ico">⚙️</span>系统设置
+        </button>
+        <button class="tab" data-tab="personal">
+          <span class="ico">🎨</span>个性化
+        </button>
+        <button class="tab" data-tab="web">
+          <span class="ico">🌐</span>网页设置
+        </button>
+      </nav>
+      <div class="side-foot">
+        <button id="backBtn">← 返回主界面</button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <!-- 系统设置 -->
+      <section class="panel active" id="tab-system">
+        <div class="panel-head">
+          <h2>系统设置</h2>
+          <span class="hint">客户端行为相关</span>
+        </div>
+        <div class="panel-body">
+          <div class="row">
+            <div>
+              <div class="label">开机自动启动</div>
+              <div class="desc">登录 Windows 后自动在后台启动 DeepSeek Harness（打开客户端时无需等待）</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="autoStartToggle" /><span class="slider"></span></label>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">关闭客户端时停止 dsh 服务</div>
+              <div class="desc">关闭窗口时停止由本客户端启动的 dsh 后台服务（原本就在运行的服务不受影响）</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="stopToggle" /><span class="slider"></span></label>
+          </div>
+        </div>
+      </section>
+
+      <!-- 个性化 -->
+      <section class="panel" id="tab-personal">
+        <div class="panel-head">
+          <h2>个性化</h2>
+          <span class="hint">自定义提示词，每次对话自动附加在系统提示词后面</span>
+        </div>
+        <div class="panel-body">
+          <div class="instr-path" id="instrPath"></div>
+          <textarea id="instrTextarea" spellcheck="false" placeholder="在这里写下你的个性化提示词，例如：&#10;&#10;- 始终使用中文回答&#10;- 代码注释用中文&#10;- 回答尽量简洁&#10;&#10;保存后，每次对话都会把上面的内容附加到系统提示词后面。"></textarea>
+          <div class="save-row">
+            <button id="saveBtn">保存提示词</button>
+            <span id="saveStatus"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 网页设置（移植原 dsh 设置面板） -->
+      <section class="panel" id="tab-web">
+        <iframe id="webFrame" src="http://127.0.0.1:3080/"></iframe>
+      </section>
+    </main>
+  </div>
+
+  <script src="settings.js"></script>
+</body>
+</html>

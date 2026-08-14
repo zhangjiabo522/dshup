@@ -621,18 +621,13 @@ async function prepareToStart(onEvent) {
     if (!checkout.built) {
       emit('log', { message: '检测到源码仓库但 Web 前端未构建，回退到 npm 安装方式。' });
     } else {
-      if (!pnpm) {
-        if (!nodeExe) {
-          const n = await installNode(onEvent);
-          pnpm = await installPnpm(n, onEvent);
-        } else {
-          pnpm = await installPnpm(nodeExe, onEvent);
-        }
-      }
+      let node = nodeExe;
+      if (!node) node = await installNode(onEvent);
       emit('status', { message: `使用本地源码仓库启动: ${checkout.dir}` });
-      // 用 pnpm 绝对路径调用，绝不修改 PATH：否则 dsh 进程环境会被私有 runtime
-      // 目录污染，dsh 派生的所有工具（含打包脚本）都会错误解析 node/npm
-      return { command: `"${pnpm}" dsh web`, cwd: checkout.dir, env: { ...process.env } };
+      // 用 node 绝对路径 + tsx 直接跑 dsh 源码（与官方 `dsh` 脚本相同）。
+      // 完全绕开 pnpm（corepack shim 依赖 PATH 里的 node，开机自启等 PATH 残缺场景会失败），
+      // 且不修改 PATH（避免污染 dsh 进程环境）。
+      return { command: `"${node}" --import tsx/esm apps/cli/src/bin.ts web`, cwd: checkout.dir, env: { ...process.env } };
     }
   }
 

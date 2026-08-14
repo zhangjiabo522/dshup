@@ -32,8 +32,9 @@ contextBridge.exposeInMainWorld('dshClient', {
   },
   instructions: {
     get: () => ipcRenderer.invoke('instructions:get'),
-    set: (content) => ipcRenderer.invoke('instructions:set', content),
+    set: (payload) => ipcRenderer.invoke('instructions:set', payload),
   },
+  notifyTaskComplete: () => ipcRenderer.send('task-complete'),
   stats: {
     get: () => ipcRenderer.invoke('stats:get'),
   },

@@ -608,12 +608,21 @@ async function prepareToStart(onEvent) {
 }
 
 function spawnServer(plan, emit) {
-  // cmd.exe 用绝对路径（自启场景 PATH 可能不完整）；env 保证 PATH 至少含 System32
-  const child = spawn(resolveCmd(), ['/d', '/s', '/c', plan.command], {
+  // 通过临时 .cmd 文件执行：spawn(cmd,['/s','/c',command]) 会被 cmd 的引号剥离破坏
+  // （含引号的路径变成 \"...\" 字面量 → "不是内部或外部命令"）。写成批处理文件后由
+  // cmd 按标准规则解析，引号/路径/命令都可靠（与 runCmd 同一方案）。
+  const bat = path.join(os.tmpdir(), `dsh-srv-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}.cmd`);
+  fs.writeFileSync(bat, '@echo off\r\n' + plan.command + '\r\n', 'utf8');
+  const child = spawn(resolveCmd(), ['/d', '/c', `"${bat}"`], {
     cwd: plan.cwd,
     env: withSanePath(plan.env || process.env),
     windowsHide: false,
+    windowsVerbatimArguments: true,
     stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  // 服务退出后清理批处理文件
+  child.on('close', () => {
+    try { fs.unlinkSync(bat); } catch (e) { /* ignore */ }
   });
   const push = (buf) => {
     const text = (buf || '').toString().trim();

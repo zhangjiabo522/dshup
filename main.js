@@ -75,6 +75,105 @@ function writeInstructions(content) {
   fs.writeFileSync(file, content, 'utf8');
 }
 
+// ---------------- AGENTS.md 结构化内容（偏好块 + 记忆块 + 自由提示词） ----------------
+
+const PREF_OPEN = '<!-- dshup:preferences -->';
+const PREF_CLOSE = '<!-- /dshup:preferences -->';
+const MEM_OPEN = '<!-- dshup:memory -->';
+const MEM_CLOSE = '<!-- /dshup:memory -->';
+
+/** 记忆机制指引（开关打开时注入，指示 AI 自主维护记忆块并每次会话先读取）。 */
+const MEMORY_GUIDE = [
+  '## 记忆机制（dshup 客户端）',
+  '每次新会话开始时，先读取本文件（%DSH_HOME%/AGENTS.md）中 `<!-- dshup:memory -->` 与 `<!-- /dshup:memory -->` 之间的记忆块，并遵循其中记录的用户偏好。',
+  '当你在对话中发现用户表达的重要偏好、习惯或个人信息（如喜欢的编程语言、代码风格、称呼方式、常用工具、工作流程）时，用文件工具（read + str_replace_editor）读取本文件，并在记忆块内追加或更新一条记忆：每条一行、简洁明确、不重复已有条目。',
+  '',
+].join('\n');
+
+/** 从块标记中提取内容（缺失时返回空字符串）。 */
+function extractBlock(doc, open, close) {
+  const start = doc.indexOf(open);
+  if (start < 0) return '';
+  const bodyStart = start + open.length;
+  const end = doc.indexOf(close, bodyStart);
+  if (end < 0) return '';
+  return doc.slice(bodyStart, end).replace(/^\r?\n/, '').replace(/\r?\n[ \t]*$/, '');
+}
+
+/** 移除块及其首尾空行，返回剩余自由内容。 */
+function removeBlock(doc, open, close) {
+  const start = doc.indexOf(open);
+  if (start < 0) return doc;
+  const end = doc.indexOf(close, start);
+  if (end < 0) return doc;
+  const before = doc.slice(0, start);
+  const after = doc.slice(end + close.length);
+  return (before.replace(/\s+$/, '') + '\n' + after.replace(/^\s+/, '')).replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** 组装完整 AGENTS.md 内容。 */
+function renderAgentsDoc(parts) {
+  const sections = [];
+  if (parts.preferences && parts.preferences.trim() !== '') {
+    sections.push(PREF_OPEN + '\n' + parts.preferences.trim() + '\n' + PREF_CLOSE);
+  }
+  if (parts.memoryEnabled && parts.memory && parts.memory.trim() !== '') {
+    sections.push(MEM_OPEN + '\n' + parts.memory.trim() + '\n' + MEM_CLOSE);
+  }
+  if (parts.memoryEnabled) {
+    sections.push(MEMORY_GUIDE);
+  }
+  if (parts.freePrompt && parts.freePrompt.trim() !== '') {
+    sections.push(parts.freePrompt.trim());
+  }
+  return sections.join('\n\n') + '\n';
+}
+
+/** 读取 AGENTS.md 并解析为结构化内容。 */
+function readAgentsDoc() {
+  const doc = readInstructions();
+  const preferencesText = extractBlock(doc, PREF_OPEN, PREF_CLOSE).trim();
+  const memory = extractBlock(doc, MEM_OPEN, MEM_CLOSE).trim();
+  const memoryEnabled = doc.indexOf(MEM_OPEN) >= 0 && /记忆机制（dshup 客户端）/.test(doc);
+  const freePrompt = removeBlock(removeBlock(doc, MEM_OPEN, MEM_CLOSE), PREF_OPEN, PREF_CLOSE).trim();
+  // 记忆内容在关闭时保留在客户端设置中，便于重新开启后恢复
+  const saved = readClientSettings().prefs || {};
+  return {
+    file: instructionsFile(),
+    freePrompt,
+    preferences: preferencesFromText(preferencesText),
+    preferencesText,
+    memory: memory || saved.memory || '',
+    memoryEnabled,
+  };
+}
+
+/** 偏好块文本 → 结构化对象（`- 回答语言：中文` 行）。 */
+function preferencesFromText(text) {
+  const result = { language: '', style: '' };
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const m = /-\s*([^：:]+)[：:]\s*(.+)/.exec(line.trim());
+    if (!m) continue;
+    const key = m[1].trim();
+    const value = m[2].trim();
+    if (key === '回答语言') result.language = value;
+    if (key === '回答风格') result.style = value;
+  }
+  return result;
+}
+
+/** 偏好对象 → 块文本。 */
+function preferencesToText(prefs) {
+  if (!prefs) return '';
+  const rows = [];
+  const labels = { language: '回答语言', style: '回答风格' };
+  for (const key of ['language', 'style']) {
+    const value = prefs[key];
+    if (value && value !== '' && value !== 'default') rows.push(`- ${labels[key]}：${value}`);
+  }
+  return rows.join('\n');
+}
+
 // 开机自启注册表操作
 function setAutoStartReg(enable) {
   const { execFileSync } = require('child_process');
@@ -192,6 +291,67 @@ function createWindow() {
     const checkSettings = process.argv.includes('--check-settings');
     const checkStats = process.argv.includes('--check-stats');
     const checkVoice = process.argv.includes('--check-voice');
+    const checkPrefs = process.argv.includes('--check-prefs');
+
+    if (checkPrefs) {
+      // 新个性化/通知功能验证：设置项存在性 + instructions 结构化往返（结束后恢复）
+      win.webContents.on('did-finish-load', () => {
+        const url = win.webContents.getURL();
+        if (!url.startsWith('http://127.0.0.1:') && !url.startsWith('http://localhost:')) return;
+        setTimeout(async () => {
+          try {
+            const result = await win.webContents.executeJavaScript(`(async () => {
+              const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+              // 打开设置
+              let settingsBtn = [...document.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '设置');
+              if (!settingsBtn) {
+                const open = [...document.querySelectorAll('button')].find((x) => (x.getAttribute('aria-label') || '').includes('打开侧边栏'));
+                if (open) open.click();
+                await sleep(1200);
+                settingsBtn = [...document.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '设置');
+              }
+              if (settingsBtn) settingsBtn.click();
+              await sleep(1500);
+              const dialog = document.querySelector('[role="dialog"]') || document.querySelector('[aria-modal="true"]');
+              if (!dialog) return { dialog: false };
+              const bodyText = dialog.textContent || '';
+              // 系统设置
+              const systemNav = [...dialog.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '系统设置');
+              let systemInfo = null;
+              if (systemNav) { systemNav.click(); await sleep(600); systemInfo = { hasNotify: /任务完成时发送系统通知/.test(dialog.textContent || ''), hasAutoStart: /开机自动启动/.test(dialog.textContent || ''), hasStop: /关闭客户端时停止/.test(dialog.textContent || '') }; }
+              // 个性化
+              const personalNav = [...dialog.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '个性化');
+              let personalInfo = null;
+              if (personalNav) { personalNav.click(); await sleep(600); const pt = dialog.textContent || ''; personalInfo = { hasLanguage: /回答语言/.test(pt), hasStyle: /回答风格/.test(pt), hasMemory: /记忆功能/.test(pt), hasClear: /清空记忆/.test(pt), hasSave: /保存全部个性化设置/.test(pt) }; }
+              return { dialog: true, systemInfo, personalInfo };
+            })()`);
+            console.log('[prefs-check] ' + JSON.stringify(result));
+            // instructions 结构化往返（保存后恢复原状）
+            let orig = '';
+            try {
+              orig = fs.readFileSync(path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'AGENTS.md'), 'utf8');
+            } catch (e) {
+              orig = '';
+            }
+            const before = readAgentsDoc();
+            writeInstructions(renderAgentsDoc({ freePrompt: before.freePrompt, preferences: '- 回答语言：中文\n- 回答风格：简洁', memory: '- 测试记忆', memoryEnabled: true }));
+            const after = readAgentsDoc();
+            console.log('[prefs-roundtrip] ' + JSON.stringify({ preferences: after.preferences, memory: after.memory, memoryEnabled: after.memoryEnabled }));
+            // 恢复
+            fs.writeFileSync(before.file, orig, 'utf8');
+            app.exit(0);
+          } catch (e) {
+            console.error('[prefs-check] failed: ' + e.message);
+            app.exit(1);
+          }
+        }, 4000);
+      });
+      setTimeout(() => {
+        console.error('[smoke] TIMEOUT');
+        app.exit(1);
+      }, 120000);
+      return;
+    }
 
     if (checkVoice) {
       // 语音输入验证：按钮位置（上下文圈圈与发送按钮之间）+ 设置面板"语音输入"tab + asr 配置往返
@@ -780,12 +940,44 @@ ipcMain.handle('settings:set', (_e, key, value) => {
   return next;
 });
 
-// 用户个性化提示词（$DSH_HOME/AGENTS.md）
-ipcMain.handle('instructions:get', () => ({ file: instructionsFile(), content: readInstructions() }));
-ipcMain.handle('instructions:set', (_e, content) => {
-  const text = typeof content === 'string' ? content : '';
-  writeInstructions(text);
+// 用户个性化（$DSH_HOME/AGENTS.md 结构化内容：偏好块 + 记忆块 + 自由提示词）
+ipcMain.handle('instructions:get', () => readAgentsDoc());
+ipcMain.handle('instructions:set', (_e, payload) => {
+  const p = payload && typeof payload === 'object' ? payload : {};
+  // 向后兼容：旧调用传纯字符串视为自由提示词
+  if (typeof payload === 'string') {
+    const doc = readAgentsDoc();
+    writeInstructions(renderAgentsDoc({ ...doc, freePrompt: payload }));
+    return { ok: true };
+  }
+  const preferences = typeof p.preferences === 'string' ? p.preferences : preferencesToText(p.preferences);  const next = {
+    freePrompt: typeof p.freePrompt === 'string' ? p.freePrompt : '',
+    preferences,
+    memory: typeof p.memory === 'string' ? p.memory : '',
+    memoryEnabled: p.memoryEnabled === true,
+  };
+  // 记忆内容持久化到客户端设置（关闭记忆时也不丢失，重新开启可恢复）
+  writeClientSettings({ prefs: { preferences, memory: next.memory, memoryEnabled: next.memoryEnabled } });
+  writeInstructions(renderAgentsDoc(next));
   return { ok: true };
+});
+
+// 任务完成系统通知：dsh 前端在会话 running 结束（true→false）时通知主进程
+ipcMain.on('task-complete', () => {
+  try {
+    if (readClientSettings().notifyOnComplete !== true) return;
+    const { Notification } = require('electron');
+    if (!Notification.isSupported()) return;
+    const n = new Notification({
+      title: 'DeepSeek Harness',
+      body: '任务已完成',
+      icon: path.join(__dirname, 'assets', 'icon.png'),
+      silent: false,
+    });
+    n.show();
+  } catch (e) {
+    console.error('[notify] 任务完成通知失败:', e.message);
+  }
 });
 
 // 会话统计：用系统 Node（>=22.15 内置 node:zlib zstd）扫描 $DSH_HOME/sessions 聚合

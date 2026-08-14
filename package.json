@@ -17,7 +17,7 @@
   "build": {
     "appId": "com.deepseekai.dsh-client",
     "productName": "DeepSeek Harness",
-    "artifactName": "DeepSeekHarnessClient-Setup-${version}.${ext}",
+    "artifactName": "dshup-Setup-${version}.${ext}",
     "directories": {
       "output": "release"
     },

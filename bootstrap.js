@@ -324,8 +324,9 @@ function unzip(zipFile, destDir) {
   // Windows 10+ 自带 bsdtar（--force-local 防止把 C:\ 等路径当远程主机）
   const r1 = runCmd(`tar --force-local -xf "${zipFile}" -C "${destDir}"`);
   if (r1.status === 0) return;
-  // 回退：PowerShell Expand-Archive
-  const r2 = runCmd(`powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '${zipFile}' -DestinationPath '${destDir}' -Force"`);
+  // 回退：PowerShell Expand-Archive（绝对路径，PATH 残缺也能找到）
+  const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const r2 = runCmd(`"${ps}" -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '${zipFile}' -DestinationPath '${destDir}' -Force"`);
   if (r2.status !== 0) {
     throw new Error('解压失败: ' + (r2.stderr || r2.stdout || r1.stderr || '未知错误'));
   }

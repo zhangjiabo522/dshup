@@ -37,7 +37,8 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Build
-        run: node node_modules/electron-builder/out/cli/cli.js ${{ matrix.args }}
+        # --publish never：禁用 tag 触发的隐式发布（发布由下方 action-gh-release 完成）
+        run: node node_modules/electron-builder/out/cli/cli.js ${{ matrix.args }} --publish never
         env:
           # CI 构建机在海外：直接用官方源下载 Electron/工具链
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'

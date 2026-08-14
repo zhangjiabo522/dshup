@@ -30,13 +30,16 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Remove CN mirror config (CI runners are overseas)
+        run: node -e "try{require('fs').unlinkSync('.npmrc')}catch(e){}"
+
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
       - name: Build
-        run: npx electron-builder ${{ matrix.args }}
+        run: node node_modules/electron-builder/out/cli/cli.js ${{ matrix.args }}
         env:
-          # CI 构建机在海外：直接用官方源下载 Electron/工具链（国内镜像反而会拖慢或失败）
+          # CI 构建机在海外：直接用官方源下载 Electron/工具链
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
       - name: Publish release

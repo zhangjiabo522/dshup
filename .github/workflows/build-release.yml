@@ -5,6 +5,8 @@ on:
   push:
     tags:
       - 'v*'
+  # 手动触发：只构建 + 冒烟测试，不发布（用于验证工作流改动）
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -43,7 +45,47 @@ jobs:
           # CI 构建机在海外：直接用官方源下载 Electron/工具链
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
+      - name: Smoke test (全新机首启：静默安装 + 启动 20 秒不崩溃)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem release\dshup-Setup-*.exe | Select-Object -First 1
+          if (-not $setup) { Write-Output "未找到安装包"; exit 1 }
+          Write-Output "静默安装 $($setup.FullName)"
+          Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait
+          $exe = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\DeepSeek Harness.exe"
+          if (-not (Test-Path $exe)) { Write-Output "安装后未找到 $exe"; exit 1 }
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) { Write-Output "首启 20 秒内退出，退出码 $($p.ExitCode)"; exit 1 }
+          Write-Output "首启存活 20 秒，冒烟通过"
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+
+      - name: Smoke test (全新机首启：启动 .app 20 秒不崩溃)
+        if: matrix.name == 'macos'
+        run: |
+          set -e
+          APP=$(find release -maxdepth 2 -name '*.app' -type d | head -n 1)
+          [ -n "$APP" ] || { echo "未找到 .app"; exit 1; }
+          echo "冒烟目标: $APP"
+          # 直接执行 Mach-O 二进制：产物未签名/未公证，绕开 Gatekeeper 隔离
+          EXE_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Contents/Info.plist")
+          "$APP/Contents/MacOS/$EXE_NAME" > /tmp/dshup-smoke.log 2>&1 &
+          PID=$!
+          sleep 20
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "首启存活 20 秒，冒烟通过"
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          else
+            echo "首启 20 秒内退出，日志如下："
+            cat /tmp/dshup-smoke.log
+            exit 1
+          fi
+          tail -n 30 /tmp/dshup-smoke.log || true
+
       - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

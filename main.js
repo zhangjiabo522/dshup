@@ -18,16 +18,17 @@ app.setPath(
 const SPLASH = path.join(__dirname, 'renderer', 'index.html');
 const SETTINGS_PAGE = path.join(__dirname, 'renderer', 'settings.html');
 
-// 客户端本地设置文件
+// 客户端本地设置文件（分平台：Windows LOCALAPPDATA / macOS Application Support）
 function clientSettingsFile() {
-  return path.join(
-    process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
-    'DeepSeekHarnessClient',
-    'client-settings.json'
-  );
+  const base =
+    process.platform === 'win32'
+      ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+      : path.join(os.homedir(), 'Library', 'Application Support');
+  return path.join(base, 'DeepSeekHarnessClient', 'client-settings.json');
 }
 
 function autoStartRegExists() {
+  if (process.platform !== 'win32') return false;
   try {
     const { execFileSync } = require('child_process');
     const out = execFileSync('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'DeepSeek Harness'], { encoding: 'utf8', windowsHide: true, timeout: 8000 });
@@ -267,12 +268,20 @@ if (!gotLock) {
   });
 }
 
-// 首次正常启动（打包版）时注册开机自启：登录 Windows 自动后台拉起 dsh
-// 尊重客户端设置 autoStart（默认关闭）；写入 HKCU Run 键
+// 首次正常启动（打包版）时注册开机自启：Windows 写 HKCU Run 键 / macOS 用 launchd（Electron API）
 function ensureAutoStart() {
   try {
     if (!app.isPackaged || AUTO_START || SMOKE) return;
-    if (readClientSettings().autoStart) setAutoStartReg(true);
+    if (readClientSettings().autoStart) {
+      if (process.platform === 'darwin') {
+        const settings = app.getLoginItemSettings();
+        if (!settings.openAtLogin) {
+          app.setLoginItemSettings({ openAtLogin: true, openAsHidden: false, args: ['--autostart'] });
+        }
+      } else {
+        setAutoStartReg(true);
+      }
+    }
   } catch (e) {
     console.error('[autostart] 注册失败:', e.message);
   }
@@ -970,7 +979,13 @@ ipcMain.handle('auto-open-settings-panel', async () => {
 ipcMain.handle('settings:get', () => readClientSettings());
 ipcMain.handle('settings:set', (_e, key, value) => {
   const next = writeClientSettings({ [key]: value });
-  if (key === 'autoStart') setAutoStartReg(!!value);
+  if (key === 'autoStart') {
+    if (process.platform === 'darwin') {
+      app.setLoginItemSettings({ openAtLogin: !!value, openAsHidden: false, args: ['--autostart'] });
+    } else {
+      setAutoStartReg(!!value);
+    }
+  }
   return next;
 });
 

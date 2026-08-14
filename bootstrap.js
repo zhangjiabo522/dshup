@@ -29,6 +29,10 @@ const DSH_PACKAGE = '@deepseek-ai/dsh';
 const MAX_POLL_MS = 180000; // 等待 dsh 启动的最长时间
 const POLL_INTERVAL_MS = 1200;
 
+// 平台分支：Windows（cmd/where/注册表）与 macOS（sh/which/launchd 由 Electron API 处理）
+const IS_WIN = process.platform === 'win32';
+const IS_MAC = process.platform === 'darwin';
+
 // 已知的本地源码仓库候选（先于 npm 安装复用；可用 DSH_CHECKOUT 环境变量覆盖）
 const CHECKOUT_CANDIDATES = () => {
   const list = [];
@@ -36,13 +40,15 @@ const CHECKOUT_CANDIDATES = () => {
   list.push(
     path.join(os.homedir(), 'deepseek-harness'),
     path.join(os.homedir(), 'DeepSeek-Harness'),
-    'C:\\Users\\zjb\\deepseek-harness',
   );
+  if (IS_WIN) list.push('C:\\Users\\zjb\\deepseek-harness');
   return list;
 };
 
 function runtimeDir() {
-  const base = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  const base = IS_WIN
+    ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+    : path.join(os.homedir(), 'Library', 'Application Support');
   return path.join(base, 'DeepSeekHarnessClient', 'runtime');
 }
 
@@ -97,29 +103,35 @@ function withSanePath(env) {
 }
 
 function runCmd(command, opts = {}) {
-  // 通过临时 .cmd 文件执行：spawnSync('cmd.exe',[args]) 直接拼参数会被 cmd 二次解析破坏引号，
-  // 写成批处理文件后由 cmd 按标准规则解析，引号/路径/命令都可靠。
   const { cwd, env, timeout } = opts;
-  const bat = path.join(os.tmpdir(), `dsh-cmd-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}.cmd`);
-  fs.writeFileSync(bat, '@echo off\r\n' + command + '\r\nexit /b %errorlevel%\r\n', 'utf8');
-  try {
-    const res = spawnSync(resolveCmd(), ['/d', '/c', `"${bat}"`], {
-      cwd: cwd || process.cwd(),
-      env: withSanePath(env || process.env),
-      encoding: 'utf8',
-      timeout: timeout || 120000,
-      windowsHide: true,
-      windowsVerbatimArguments: true,
-      maxBuffer: 64 * 1024 * 1024,
-    });
-    return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
-  } finally {
+  if (IS_WIN) {
+    // Windows：通过临时 .cmd 文件执行（cmd 引号解析可靠）
+    const bat = path.join(os.tmpdir(), `dsh-cmd-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}.cmd`);
+    fs.writeFileSync(bat, '@echo off\r\n' + command + '\r\nexit /b %errorlevel%\r\n', 'utf8');
     try {
-      fs.unlinkSync(bat);
-    } catch (e) {
-      /* ignore */
+      const res = spawnSync(resolveCmd(), ['/d', '/c', `"${bat}"`], {
+        cwd: cwd || process.cwd(),
+        env: withSanePath(env || process.env),
+        encoding: 'utf8',
+        timeout: timeout || 120000,
+        windowsHide: true,
+        windowsVerbatimArguments: true,
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
+    } finally {
+      try { fs.unlinkSync(bat); } catch (e) { /* ignore */ }
     }
   }
+  // macOS / 其他：/bin/sh -c
+  const res = spawnSync('/bin/sh', ['-c', command], {
+    cwd: cwd || process.cwd(),
+    env: env || process.env,
+    encoding: 'utf8',
+    timeout: timeout || 120000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
 }
 
 function runExe(exe, args, opts = {}) {
@@ -303,6 +315,12 @@ async function download(url, dest, emit) {
 function unzip(zipFile, destDir) {
   const stat = fs.statSync(zipFile);
   if (stat.size < 1000) throw new Error(`解压失败：压缩包疑似不完整（${stat.size} 字节）`);
+  if (IS_MAC || !IS_WIN) {
+    // macOS：tar（支持 gz/zip）
+    const r = runCmd(`tar -xzf "${zipFile}" -C "${destDir}"`);
+    if (r.status !== 0) throw new Error('解压失败: ' + (r.stderr || r.stdout || '未知错误'));
+    return;
+  }
   // Windows 10+ 自带 bsdtar（--force-local 防止把 C:\ 等路径当远程主机）
   const r1 = runCmd(`tar --force-local -xf "${zipFile}" -C "${destDir}"`);
   if (r1.status === 0) return;
@@ -383,26 +401,45 @@ async function httpGetJson(url, timeout = 20000) {
 
 // ---------------- 检测 ----------------
 
+/** 私有 runtime 下的 node 可执行文件（分平台）。 */
+function privateNodeExe() {
+  return IS_WIN
+    ? path.join(runtimeDir(), 'node', 'node.exe')
+    : path.join(runtimeDir(), 'node', 'bin', 'node');
+}
+
+/** 私有 runtime 下的 bin 脚本名（Windows 带 .cmd）。 */
+function binName(name) {
+  return IS_WIN ? name + '.cmd' : name;
+}
+
 function findOnPath(exe) {
-  const res = runExe('where.exe', [exe], { timeout: 15000 });
+  if (IS_WIN) {
+    const res = runExe('where.exe', [exe], { timeout: 15000 });
+    if (res.status !== 0) return null;
+    const line = (res.stdout || '')
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .find((s) => {
+        if (!s) return false;
+        const lower = s.toLowerCase();
+        return lower.endsWith('.exe') || lower.endsWith('.cmd');
+      });
+    return line || null;
+  }
+  // macOS / 其他：which
+  const res = runExe('/usr/bin/which', [exe], { timeout: 15000 });
   if (res.status !== 0) return null;
-  const line = (res.stdout || '')
-    .split(/\r?\n/)
-    .map((s) => s.trim())
-    .find((s) => {
-      if (!s) return false;
-      const lower = s.toLowerCase();
-      return lower.endsWith('.exe') || lower.endsWith('.cmd');
-    });
+  const line = (res.stdout || '').split(/\r?\n/).map((s) => s.trim()).find((s) => s !== '');
   return line || null;
 }
 
 function detectNode() {
   // 1) 私有运行时里的 node
-  const privateNode = path.join(runtimeDir(), 'node', 'node.exe');
+  const privateNode = privateNodeExe();
   if (fs.existsSync(privateNode)) return privateNode;
   // 2) 系统 PATH 中的 node（校验版本）
-  const sys = findOnPath('node.exe');
+  const sys = findOnPath(IS_WIN ? 'node.exe' : 'node');
   if (sys && fs.existsSync(sys)) {
     const ver = parseNodeVersion(runExe(sys, ['--version']).stdout);
     if (nodeVersionOk(ver)) return sys;
@@ -411,15 +448,15 @@ function detectNode() {
 }
 
 function detectPnpm() {
-  const privatePnpm = path.join(runtimeDir(), 'node_modules', '.bin', 'pnpm.cmd');
+  const privatePnpm = path.join(runtimeDir(), 'node_modules', '.bin', binName('pnpm'));
   if (fs.existsSync(privatePnpm)) return privatePnpm;
-  const sys = findOnPath('pnpm.cmd') || findOnPath('pnpm.exe');
+  const sys = findOnPath(binName('pnpm')) || (IS_WIN ? findOnPath('pnpm.exe') : null);
   if (sys && fs.existsSync(sys)) return sys;
   return null;
 }
 
 function detectDshOnPath() {
-  const p = findOnPath('dsh.cmd') || findOnPath('dsh.exe');
+  const p = findOnPath(binName('dsh')) || (IS_WIN ? findOnPath('dsh.exe') : null);
   if (p && fs.existsSync(p)) return p;
   return null;
 }
@@ -468,7 +505,8 @@ async function installNode(onEvent) {
   const rt = runtimeDir();
   fs.mkdirSync(rt, { recursive: true });
   const dest = path.join(rt, 'node');
-  if (fs.existsSync(path.join(dest, 'node.exe'))) return path.join(dest, 'node.exe');
+  const destExe = IS_WIN ? path.join(dest, 'node.exe') : path.join(dest, 'bin', 'node');
+  if (fs.existsSync(destExe)) return destExe;
 
   emit('status', { message: '未检测到可用的 Node.js，正在从国内镜像下载安装…' });
 
@@ -490,7 +528,14 @@ async function installNode(onEvent) {
     emit('log', { message: `获取 Node 版本列表失败，使用默认版本 ${version}: ${e.message}` });
   }
 
-  const zipName = `node-${version}-win-x64.zip`;
+  // Windows: win-x64.zip；macOS: darwin-arm64.tar.gz（Apple Silicon）/ darwin-x64.tar.gz
+  let zipName;
+  if (IS_WIN) {
+    zipName = `node-${version}-win-x64.zip`;
+  } else {
+    const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+    zipName = `node-${version}-darwin-${arch}.tar.gz`;
+  }
   const url = `${NODE_MIRROR}/${version}/${zipName}`;
   const zipFile = path.join(rt, zipName);
   emit('progress', { pct: 0, message: `下载 ${zipName}…` });
@@ -510,30 +555,29 @@ async function installNode(onEvent) {
       /* ignore */
     }
   }
-  const nodeExe = path.join(dest, 'node.exe');
-  if (!fs.existsSync(nodeExe)) throw new Error('Node.js 安装失败：未找到 node.exe');
+  if (!fs.existsSync(destExe)) throw new Error(`Node.js 安装失败：未找到 ${path.basename(destExe)}`);
   emit('status', { message: `Node.js 已就绪: ${version}` });
-  return nodeExe;
+  return destExe;
 }
 
 async function installPnpm(nodeExe, onEvent) {
   const emit = createEmitter(onEvent);
   const rt = runtimeDir();
-  const privatePnpm = path.join(rt, 'node_modules', '.bin', 'pnpm.cmd');
+  const privatePnpm = path.join(rt, 'node_modules', '.bin', binName('pnpm'));
   if (fs.existsSync(privatePnpm)) return privatePnpm;
 
   emit('status', { message: `安装 pnpm@${PNPM_VERSION}（国内镜像，私有目录）…` });
-  const npmCmd = path.join(path.dirname(nodeExe), 'npm.cmd');
+  const npmCmd = path.join(path.dirname(nodeExe), binName('npm'));
   const r = runCmd(`"${npmCmd}" install --prefix "${rt}" pnpm@${PNPM_VERSION} --registry=${NPM_MIRROR} --no-audit --no-fund${proxyArgs()}`, {
     timeout: 300000,
   });
-  // 以 pnpm.cmd 是否生成判定（npm 可能因警告/重试返回非零但实际成功）
+  // 以 bin 是否生成判定（npm 可能因警告/重试返回非零但实际成功）
   if (!fs.existsSync(privatePnpm)) {
     const detail = (r.stderr || r.stdout || '未知错误')
       .split(/\r?\n/)
       .filter((l) => l.trim() && !/^npm warn/i.test(l.trim()))
       .join('\n');
-    throw new Error('pnpm 安装失败: ' + (detail || '未生成 pnpm.cmd'));
+    throw new Error(`pnpm 安装失败: ${detail || '未生成 ' + binName('pnpm')}`);
   }
   emit('status', { message: `pnpm@${PNPM_VERSION} 已就绪` });
   return privatePnpm;
@@ -542,21 +586,21 @@ async function installPnpm(nodeExe, onEvent) {
 async function installDsh(nodeExe, onEvent) {
   const emit = createEmitter(onEvent);
   const rt = runtimeDir();
-  const bin = path.join(rt, 'node_modules', '.bin', 'dsh.cmd');
+  const bin = path.join(rt, 'node_modules', '.bin', binName('dsh'));
   if (fs.existsSync(bin)) return bin;
 
   emit('status', { message: `安装 ${DSH_PACKAGE}（国内镜像，私有目录）…` });
-  const npmCmd = path.join(path.dirname(nodeExe), 'npm.cmd');
+  const npmCmd = path.join(path.dirname(nodeExe), binName('npm'));
   const r = runCmd(`"${npmCmd}" install --prefix "${rt}" ${DSH_PACKAGE} --registry=${NPM_MIRROR} --no-audit --no-fund${proxyArgs()}`, {
     timeout: 600000,
   });
-  // npm 可能因网络重试/警告返回非零但实际已装好：以 dsh.cmd 是否生成判定
+  // npm 可能因网络重试/警告返回非零但实际已装好：以 bin 是否生成判定
   if (!fs.existsSync(bin)) {
     const detail = (r.stderr || r.stdout || '未知错误')
       .split(/\r?\n/)
       .filter((l) => l.trim() && !/^npm warn/i.test(l.trim()))
       .join('\n');
-    throw new Error('dsh 安装失败: ' + (detail || '未生成 dsh.cmd'));
+    throw new Error(`dsh 安装失败: ${detail || '未生成 ' + binName('dsh')}`);
   }
   emit('status', { message: 'DeepSeek Harness 已安装到私有目录' });
   return bin;
@@ -608,22 +652,37 @@ async function prepareToStart(onEvent) {
 }
 
 function spawnServer(plan, emit) {
-  // 通过临时 .cmd 文件执行：spawn(cmd,['/s','/c',command]) 会被 cmd 的引号剥离破坏
-  // （含引号的路径变成 \"...\" 字面量 → "不是内部或外部命令"）。写成批处理文件后由
-  // cmd 按标准规则解析，引号/路径/命令都可靠（与 runCmd 同一方案）。
-  const bat = path.join(os.tmpdir(), `dsh-srv-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}.cmd`);
-  fs.writeFileSync(bat, '@echo off\r\n' + plan.command + '\r\n', 'utf8');
-  const child = spawn(resolveCmd(), ['/d', '/c', `"${bat}"`], {
+  if (IS_WIN) {
+    // 通过临时 .cmd 文件执行：spawn(cmd,['/s','/c',command]) 会被 cmd 的引号剥离破坏
+    // （含引号的路径变成 \"...\" 字面量 → "不是内部或外部命令"）。写成批处理文件后由
+    // cmd 按标准规则解析，引号/路径/命令都可靠（与 runCmd 同一方案）。
+    const bat = path.join(os.tmpdir(), `dsh-srv-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}.cmd`);
+    fs.writeFileSync(bat, '@echo off\r\n' + plan.command + '\r\n', 'utf8');
+    const child = spawn(resolveCmd(), ['/d', '/c', `"${bat}"`], {
+      cwd: plan.cwd,
+      env: withSanePath(plan.env || process.env),
+      windowsHide: false,
+      windowsVerbatimArguments: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    // 服务退出后清理批处理文件
+    child.on('close', () => {
+      try { fs.unlinkSync(bat); } catch (e) { /* ignore */ }
+    });
+    attachServerLogs(child, emit);
+    return child;
+  }
+  // macOS / 其他：/bin/bash -c
+  const child = spawn('/bin/bash', ['-c', plan.command], {
     cwd: plan.cwd,
-    env: withSanePath(plan.env || process.env),
-    windowsHide: false,
-    windowsVerbatimArguments: true,
+    env: plan.env || process.env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  // 服务退出后清理批处理文件
-  child.on('close', () => {
-    try { fs.unlinkSync(bat); } catch (e) { /* ignore */ }
-  });
+  attachServerLogs(child, emit);
+  return child;
+}
+
+function attachServerLogs(child, emit) {
   const push = (buf) => {
     const text = (buf || '').toString().trim();
     if (text) emit('server', { message: text });
@@ -631,12 +690,16 @@ function spawnServer(plan, emit) {
   child.stdout.on('data', push);
   child.stderr.on('data', push);
   child.on('error', (e) => emit('error', { message: '启动进程失败: ' + e.message }));
-  return child;
 }
 
 function killProcessTree(pid) {
   try {
-    runCmd(`taskkill /PID ${pid} /T /F`, { timeout: 15000 });
+    if (IS_WIN) {
+      runCmd(`taskkill /PID ${pid} /T /F`, { timeout: 15000 });
+    } else {
+      // macOS：先杀子进程再杀本进程
+      runCmd(`pkill -TERM -P ${pid} 2>/dev/null; kill -TERM ${pid} 2>/dev/null; sleep 1; kill -KILL ${pid} 2>/dev/null`, { timeout: 15000 });
+    }
   } catch (e) {
     /* ignore */
   }

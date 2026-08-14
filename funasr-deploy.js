@@ -14,9 +14,17 @@ const os = require('os');
 const http = require('http');
 const { spawn, execFileSync } = require('child_process');
 
-const BASE = () =>
-  path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient', 'funasr');
-const VENV_PY = () => path.join(BASE(), 'venv', 'Scripts', 'python.exe');
+const BASE = () => {
+  const base =
+    process.platform === 'win32'
+      ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+      : path.join(os.homedir(), 'Library', 'Application Support');
+  return path.join(base, 'DeepSeekHarnessClient', 'funasr');
+};
+const VENV_PY = () =>
+  process.platform === 'win32'
+    ? path.join(BASE(), 'venv', 'Scripts', 'python.exe')
+    : path.join(BASE(), 'venv', 'bin', 'python');
 const SERVER_PY = () => path.join(BASE(), 'server.py');
 const SERVER_LOG = () => path.join(BASE(), 'server.log');
 const DEFAULT_PORT = 10095;
@@ -233,30 +241,37 @@ function findPython() {
   // 1) 部署目录 venv 自带且版本兼容
   if (fs.existsSync(VENV_PY()) && pythonOk(versionOf(VENV_PY()))) return VENV_PY();
   // 2) 常见安装路径直接探测（不依赖 PATH / py launcher / winget）
-  const localApps = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
   const candidates = [];
-  for (const v of ['311', '310', '39', '38']) {
-    candidates.push(
-      path.join(localApps, 'Programs', 'Python', 'Python' + v, 'python.exe'),
-      'C:\\Python' + v + '\\python.exe',
-      'C:\\Program Files\\Python' + v + '\\python.exe',
-    );
+  if (process.platform === 'win32') {
+    const localApps = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    for (const v of ['311', '310', '39', '38']) {
+      candidates.push(
+        path.join(localApps, 'Programs', 'Python', 'Python' + v, 'python.exe'),
+        'C:\\Python' + v + '\\python.exe',
+        'C:\\Program Files\\Python' + v + '\\python.exe',
+      );
+    }
+  } else {
+    // macOS：常见 python3 位置
+    candidates.push('/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3');
   }
   for (const c of candidates) {
     if (fs.existsSync(c) && pythonOk(versionOf(c))) return c;
   }
   // 3) 系统 PATH 上的 python（3.8-3.11 才接受）
-  const sysPy = tryRun('where.exe', ['python.exe'], { timeout: 15000 });
+  const sysPy = tryRun(process.platform === 'win32' ? 'where.exe' : '/usr/bin/which', [process.platform === 'win32' ? 'python.exe' : 'python3'], { timeout: 15000 });
   if (sysPy.ok) {
-    const line = (sysPy.out || '').split(/\r?\n/).map(s => s.trim()).find(s => s && s.toLowerCase().endsWith('.exe'));
+    const line = (sysPy.out || '').split(/\r?\n/).map(s => s.trim()).find(s => s && (s.toLowerCase().endsWith('.exe') || s.includes('/')));
     if (line && pythonOk(versionOf(line))) return line;
   }
-  // 4) py launcher 指定版本（3.11 → 3.10 → 3.9 → 3.8）
-  for (const v of ['3.11', '3.10', '3.9', '3.8']) {
-    const r = tryRun('py.exe', ['-' + v, '-c', 'import sys; print(sys.executable)'], { timeout: 20000 });
-    if (r.ok && r.out.trim()) {
-      const exe = r.out.trim();
-      if (pythonOk(versionOf(exe))) return exe;
+  // 4) py launcher（仅 Windows）指定版本
+  if (process.platform === 'win32') {
+    for (const v of ['3.11', '3.10', '3.9', '3.8']) {
+      const r = tryRun('py.exe', ['-' + v, '-c', 'import sys; print(sys.executable)'], { timeout: 20000 });
+      if (r.ok && r.out.trim()) {
+        const exe = r.out.trim();
+        if (pythonOk(versionOf(exe))) return exe;
+      }
     }
   }
   return null;
@@ -315,15 +330,19 @@ async function deploy(opts = {}) {
   // 1) Python（funasr/torch 生态要求 3.8-3.11；3.12+ 缺 wheel 会被自动排除）
   let python = findPython();
   if (!python) {
-    const winget = wingetExe();
-    if (winget !== null) {
-      onProgress({ type: 'step', message: '未检测到兼容的 Python（需 3.8-3.11），正在通过 winget 自动安装 Python 3.11…' });
-      tryRun(winget, ['install', '-e', '--id', 'Python.Python.3.11', '--silent', '--accept-package-agreements', '--accept-source-agreements'], { timeout: 900000 });
-      python = findPython();
+    if (process.platform === 'win32') {
+      const winget = wingetExe();
+      if (winget !== null) {
+        onProgress({ type: 'step', message: '未检测到兼容的 Python（需 3.8-3.11），正在通过 winget 自动安装 Python 3.11…' });
+        tryRun(winget, ['install', '-e', '--id', 'Python.Python.3.11', '--silent', '--accept-package-agreements', '--accept-source-agreements'], { timeout: 900000 });
+        python = findPython();
+      }
     }
     if (!python) {
       throw new Error(
-        '未检测到 Python 3.8-3.11，且自动安装不可用。请手动安装 Python 3.11（https://www.python.org/downloads/release/python-3119/ ，安装时勾选 "Add Python to PATH"），完成后重试一键部署。'
+        process.platform === 'win32'
+          ? '未检测到 Python 3.8-3.11，且自动安装不可用。请手动安装 Python 3.11（https://www.python.org/downloads/release/python-3119/ ，安装时勾选 "Add Python to PATH"），完成后重试一键部署。'
+          : '未检测到 Python 3.8-3.11。请在 macOS 上安装（brew install python@3.11），完成后重试一键部署。'
       );
     }
   }
@@ -346,8 +365,16 @@ async function deploy(opts = {}) {
 
   const venvPy = VENV_PY();
 
+  const funasrInstalled =
+    process.platform === 'win32'
+      ? fs.existsSync(path.join(base, 'venv', 'Lib', 'site-packages', 'funasr'))
+      : fs.existsSync(path.join(base, 'venv', 'lib')) &&
+        fs.existsSync(path.join(base, 'venv', 'lib', 'python3.11', 'site-packages', 'funasr')) ||
+        fs.existsSync(path.join(base, 'venv', 'lib', 'python3.10', 'site-packages', 'funasr')) ||
+        fs.existsSync(path.join(base, 'venv', 'lib', 'python3.9', 'site-packages', 'funasr')) ||
+        fs.existsSync(path.join(base, 'venv', 'lib', 'python3.8', 'site-packages', 'funasr'));
   // 3) 依赖（流式实时进度 + 多源自动回退 + 安装后导入验证）
-  if (!fs.existsSync(SERVER_PY()) || !fs.existsSync(path.join(base, 'venv', 'Lib', 'site-packages', 'funasr'))) {
+  if (!fs.existsSync(SERVER_PY()) || !funasrInstalled) {
     const relay = pipProgressRelay(onProgress);
     const TSINGHUA = ['-i', 'https://pypi.tuna.tsinghua.edu.cn/simple'];
     onProgress({ type: 'step', message: '升级 pip（清华镜像，失败自动回退官方源）…' });
@@ -440,16 +467,29 @@ async function start(onProgress) {
 
 async function stop() {
   if (!(await checkHealth(DEFAULT_PORT))) return { ok: true, already: false };
-  // 找到监听 10095 的进程并结束（powershell 用绝对路径，防 PATH 残缺）
+  // 找到监听 10095 的进程并结束
   try {
-    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-    const out = run(ps, ['-NoProfile', '-Command', `(Get-NetTCPConnection -LocalPort ${DEFAULT_PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess`], { timeout: 20000 });
-    const pid = parseInt(out.trim(), 10);
-    if (Number.isFinite(pid) && pid > 0) {
-      try {
-        run('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { timeout: 20000 });
-      } catch (e) {
-        /* ignore */
+    if (process.platform === 'win32') {
+      const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      const out = run(ps, ['-NoProfile', '-Command', `(Get-NetTCPConnection -LocalPort ${DEFAULT_PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess`], { timeout: 20000 });
+      const pid = parseInt(out.trim(), 10);
+      if (Number.isFinite(pid) && pid > 0) {
+        try {
+          run('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { timeout: 20000 });
+        } catch (e) {
+          /* ignore */
+        }
+      }
+    } else {
+      // macOS：lsof 找到监听进程并 kill
+      const out = run('/usr/sbin/lsof', ['-ti', `tcp:${DEFAULT_PORT}`], { timeout: 20000 });
+      const pid = parseInt(String(out || '').trim().split(/\s+/)[0], 10);
+      if (Number.isFinite(pid) && pid > 0) {
+        try {
+          run('/bin/kill', ['-TERM', String(pid)], { timeout: 20000 });
+        } catch (e) {
+          /* ignore */
+        }
       }
     }
   } catch (e) {

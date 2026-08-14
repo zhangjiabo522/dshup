@@ -148,6 +148,84 @@ function runExe(exe, args, opts = {}) {
   return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
 }
 
+/** 输出行 → 进度回调（节流：每秒最多一条，只转发关键行）。 */
+function progressRelay(forward) {
+  let last = 0;
+  return line => {
+    const now = Date.now();
+    if (now - last < 1000) return;
+    last = now;
+    if (/Downloading|Collecting|Installing|added|added \d+ packages|Building|Successfully|ERROR|error|reify|idealTree/i.test(line)) {
+      forward(line);
+    }
+  };
+}
+
+/**
+ * 异步执行命令（不阻塞事件循环）：长操作（npm 安装/解压）必须用它，
+ * 否则 spawnSync 会让 Electron 主进程数分钟无响应（新环境首启卡死的根因）。
+ * @param {object} opts
+ * @param {(line:string)=>void} [opts.onLine] 输出行回调（实时进度）
+ * @returns {Promise<{status:number, stdout:string, stderr:string}>}
+ */
+function runCmdAsync(command, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const { cwd, env, timeout, onLine } = opts;
+    let child;
+    let bat = null;
+    if (IS_WIN) {
+      bat = path.join(os.tmpdir(), `dsh-async-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}.cmd`);
+      fs.writeFileSync(bat, '@echo off\r\n' + command + '\r\nexit /b %errorlevel%\r\n', 'utf8');
+      child = spawn(resolveCmd(), ['/d', '/c', `"${bat}"`], {
+        cwd: cwd || process.cwd(),
+        env: withSanePath(env || process.env),
+        windowsHide: true,
+        windowsVerbatimArguments: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } else {
+      child = spawn('/bin/sh', ['-c', command], {
+        cwd: cwd || process.cwd(),
+        env: env || process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    }
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill(); } catch (e) { /* ignore */ }
+    }, timeout || 600000);
+    child.stdout.on('data', (d) => {
+      const text = d.toString('utf8');
+      stdout += text;
+      if (onLine) for (const line of text.split(/\r?\n/)) if (line.trim() !== '') onLine(line.trim());
+    });
+    child.stderr.on('data', (d) => {
+      const text = d.toString('utf8');
+      stderr += text;
+      if (onLine) for (const line of text.split(/\r?\n/)) if (line.trim() !== '') onLine(line.trim());
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (bat !== null) {
+        try { fs.unlinkSync(bat); } catch (e) { /* ignore */ }
+      }
+      if (timedOut) reject(new Error(`命令超时（${Math.round((timeout || 600000) / 60000)} 分钟）: ${command.slice(0, 80)}`));
+      else if (code === 0) resolve({ status: 0, stdout, stderr });
+      else reject(new Error(`命令失败（exit ${code}）: ${(stderr || stdout).split(/\r?\n/).filter(Boolean).slice(-6).join(' | ').slice(0, 500)}`));
+    });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      if (bat !== null) {
+        try { fs.unlinkSync(bat); } catch (e2) { /* ignore */ }
+      }
+      reject(new Error('无法启动命令: ' + e.message));
+    });
+  });
+}
+
 // ---------------- 网络（系统代理感知，兼容 Clash 等代理工具的 fake-IP DNS） ----------------
 
 function detectProxy() {
@@ -312,23 +390,30 @@ async function download(url, dest, emit) {
   throw lastErr || new Error('下载失败: ' + url);
 }
 
-function unzip(zipFile, destDir) {
+async function unzip(zipFile, destDir, onLine) {
   const stat = fs.statSync(zipFile);
   if (stat.size < 1000) throw new Error(`解压失败：压缩包疑似不完整（${stat.size} 字节）`);
   if (IS_MAC || !IS_WIN) {
     // macOS：tar（支持 gz/zip）
-    const r = runCmd(`tar -xzf "${zipFile}" -C "${destDir}"`);
-    if (r.status !== 0) throw new Error('解压失败: ' + (r.stderr || r.stdout || '未知错误'));
-    return;
+    try {
+      await runCmdAsync(`tar -xzf "${zipFile}" -C "${destDir}"`, { timeout: 300000, onLine });
+      return;
+    } catch (e) {
+      throw new Error('解压失败: ' + e.message);
+    }
   }
   // Windows 10+ 自带 bsdtar（--force-local 防止把 C:\ 等路径当远程主机）
-  const r1 = runCmd(`tar --force-local -xf "${zipFile}" -C "${destDir}"`);
-  if (r1.status === 0) return;
-  // 回退：PowerShell Expand-Archive（绝对路径，PATH 残缺也能找到）
-  const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const r2 = runCmd(`"${ps}" -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '${zipFile}' -DestinationPath '${destDir}' -Force"`);
-  if (r2.status !== 0) {
-    throw new Error('解压失败: ' + (r2.stderr || r2.stdout || r1.stderr || '未知错误'));
+  try {
+    await runCmdAsync(`tar --force-local -xf "${zipFile}" -C "${destDir}"`, { timeout: 300000, onLine });
+    return;
+  } catch (e1) {
+    // 回退：PowerShell Expand-Archive（绝对路径，PATH 残缺也能找到）
+    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    try {
+      await runCmdAsync(`"${ps}" -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '${zipFile}' -DestinationPath '${destDir}' -Force"`, { timeout: 300000, onLine });
+    } catch (e2) {
+      throw new Error('解压失败: ' + (e2.message || e1.message || '未知错误'));
+    }
   }
 }
 
@@ -546,7 +631,9 @@ async function installNode(onEvent) {
   const tmp = path.join(rt, `_node_tmp_${Date.now()}`);
   fs.mkdirSync(tmp, { recursive: true });
   try {
-    unzip(zipFile, tmp);
+    await unzip(zipFile, tmp, line => {
+      emit('progress', { message: `解压中：${line.slice(0, 80)}` });
+    });
     flattenDir(tmp, dest);
   } finally {
     rmrf(tmp);
@@ -569,16 +656,21 @@ async function installPnpm(nodeExe, onEvent) {
 
   emit('status', { message: `安装 pnpm@${PNPM_VERSION}（国内镜像，私有目录）…` });
   const npmCmd = path.join(path.dirname(nodeExe), binName('npm'));
-  const r = runCmd(`"${npmCmd}" install --prefix "${rt}" pnpm@${PNPM_VERSION} --registry=${NPM_MIRROR} --no-audit --no-fund${proxyArgs()}`, {
-    timeout: 300000,
-  });
+  let lastErr = null;
+  try {
+    // 异步执行 + 实时进度（不阻塞主进程，避免新环境首启"无响应"）
+    await runCmdAsync(`"${npmCmd}" install --prefix "${rt}" pnpm@${PNPM_VERSION} --registry=${NPM_MIRROR} --no-audit --no-fund${proxyArgs()}`, {
+      timeout: 300000,
+      onLine: progressRelay(line => {
+        emit('progress', { message: line.slice(0, 160) });
+      }),
+    });
+  } catch (e) {
+    lastErr = e;
+  }
   // 以 bin 是否生成判定（npm 可能因警告/重试返回非零但实际成功）
   if (!fs.existsSync(privatePnpm)) {
-    const detail = (r.stderr || r.stdout || '未知错误')
-      .split(/\r?\n/)
-      .filter((l) => l.trim() && !/^npm warn/i.test(l.trim()))
-      .join('\n');
-    throw new Error(`pnpm 安装失败: ${detail || '未生成 ' + binName('pnpm')}`);
+    throw new Error(`pnpm 安装失败: ${lastErr ? lastErr.message : '未生成 ' + binName('pnpm')}`);
   }
   emit('status', { message: `pnpm@${PNPM_VERSION} 已就绪` });
   return privatePnpm;
@@ -592,16 +684,21 @@ async function installDsh(nodeExe, onEvent) {
 
   emit('status', { message: `安装 ${DSH_PACKAGE}（国内镜像，私有目录）…` });
   const npmCmd = path.join(path.dirname(nodeExe), binName('npm'));
-  const r = runCmd(`"${npmCmd}" install --prefix "${rt}" ${DSH_PACKAGE} --registry=${NPM_MIRROR} --no-audit --no-fund${proxyArgs()}`, {
-    timeout: 600000,
-  });
+  let lastErr = null;
+  try {
+    // 异步执行 + 实时进度（不阻塞主进程，避免新环境首启"无响应"）
+    await runCmdAsync(`"${npmCmd}" install --prefix "${rt}" ${DSH_PACKAGE} --registry=${NPM_MIRROR} --no-audit --no-fund${proxyArgs()}`, {
+      timeout: 600000,
+      onLine: progressRelay(line => {
+        emit('progress', { message: line.slice(0, 160) });
+      }),
+    });
+  } catch (e) {
+    lastErr = e;
+  }
   // npm 可能因网络重试/警告返回非零但实际已装好：以 bin 是否生成判定
   if (!fs.existsSync(bin)) {
-    const detail = (r.stderr || r.stdout || '未知错误')
-      .split(/\r?\n/)
-      .filter((l) => l.trim() && !/^npm warn/i.test(l.trim()))
-      .join('\n');
-    throw new Error(`dsh 安装失败: ${detail || '未生成 ' + binName('dsh')}`);
+    throw new Error(`dsh 安装失败: ${lastErr ? lastErr.message : '未生成 ' + binName('dsh')}`);
   }
   emit('status', { message: 'DeepSeek Harness 已安装到私有目录' });
   return bin;

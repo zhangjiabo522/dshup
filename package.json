@@ -1,6 +1,6 @@
 {
   "name": "dshup",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "dshup — DeepSeek Harness Windows 桌面客户端：自动检测/安装依赖（国内镜像）、内嵌显示、开机自启、语音输入（MiMo ASR / FunASR 一键部署）、用量统计",
   "main": "main.js",
   "license": "MIT",
@@ -30,6 +30,10 @@
       "renderer/**/*",
       "assets/**/*",
       "package.json"
+    ],
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
     ],
     "win": {
       "target": [

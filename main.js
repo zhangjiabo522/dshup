@@ -82,17 +82,18 @@ const PREF_CLOSE = '<!-- /dshup:preferences -->';
 const MEM_OPEN = '<!-- dshup:memory -->';
 const MEM_CLOSE = '<!-- /dshup:memory -->';
 
-/** 记忆机制指引（开关打开时注入，指示 AI 自主维护记忆块并每次会话先读取）。 */
+/** 记忆机制指引（开关打开时注入，指示 AI 自主维护记忆块并每次会话先读取）。
+ *  注意：指引文字中不出现块标记的字面量，避免解析时误匹配。 */
 const MEMORY_GUIDE = [
   '## 记忆机制（dshup 客户端）',
-  '每次新会话开始时，先读取本文件（%DSH_HOME%/AGENTS.md）中 `<!-- dshup:memory -->` 与 `<!-- /dshup:memory -->` 之间的记忆块，并遵循其中记录的用户偏好。',
-  '当你在对话中发现用户表达的重要偏好、习惯或个人信息（如喜欢的编程语言、代码风格、称呼方式、常用工具、工作流程）时，用文件工具（read + str_replace_editor）读取本文件，并在记忆块内追加或更新一条记忆：每条一行、简洁明确、不重复已有条目。',
+  '每次新会话开始时，先读取本文件（%DSH_HOME%/AGENTS.md）中标记为 dshup:memory 的注释块内容，并遵循其中记录的用户偏好。',
+  '当你在对话中发现用户表达的重要偏好、习惯或个人信息（如喜欢的编程语言、代码风格、称呼方式、常用工具、工作流程）时，用文件工具（read + str_replace_editor）读取本文件，并在该记忆块内追加或更新一条记忆：每条一行、简洁明确、不重复已有条目。',
   '',
 ].join('\n');
 
-/** 从块标记中提取内容（缺失时返回空字符串）。 */
+/** 从块标记中提取内容。取最后一个 open（指引文字可能提到标记字样，真实块才是最后的）。 */
 function extractBlock(doc, open, close) {
-  const start = doc.indexOf(open);
+  const start = doc.lastIndexOf(open);
   if (start < 0) return '';
   const bodyStart = start + open.length;
   const end = doc.indexOf(close, bodyStart);
@@ -102,13 +103,23 @@ function extractBlock(doc, open, close) {
 
 /** 移除块及其首尾空行，返回剩余自由内容。 */
 function removeBlock(doc, open, close) {
-  const start = doc.indexOf(open);
+  const start = doc.lastIndexOf(open);
   if (start < 0) return doc;
   const end = doc.indexOf(close, start);
   if (end < 0) return doc;
   const before = doc.slice(0, start);
   const after = doc.slice(end + close.length);
   return (before.replace(/\s+$/, '') + '\n' + after.replace(/^\s+/, '')).replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** 移除记忆机制指引段落（以标题开头、到段落结束）。 */
+function stripGuide(doc) {
+  const idx = doc.indexOf('## 记忆机制（dshup 客户端）');
+  if (idx < 0) return doc;
+  const rest = doc.slice(idx);
+  const end = rest.indexOf('\n\n');
+  const cutTo = end >= 0 ? idx + end : doc.length;
+  return (doc.slice(0, idx) + doc.slice(cutTo)).replace(/\n{3,}/g, '\n\n').trim();
 }
 
 /** 组装完整 AGENTS.md 内容。 */
@@ -135,7 +146,7 @@ function readAgentsDoc() {
   const preferencesText = extractBlock(doc, PREF_OPEN, PREF_CLOSE).trim();
   const memory = extractBlock(doc, MEM_OPEN, MEM_CLOSE).trim();
   const memoryEnabled = doc.indexOf(MEM_OPEN) >= 0 && /记忆机制（dshup 客户端）/.test(doc);
-  const freePrompt = removeBlock(removeBlock(doc, MEM_OPEN, MEM_CLOSE), PREF_OPEN, PREF_CLOSE).trim();
+  const freePrompt = stripGuide(removeBlock(removeBlock(doc, MEM_OPEN, MEM_CLOSE), PREF_OPEN, PREF_CLOSE)).trim();
   // 记忆内容在关闭时保留在客户端设置中，便于重新开启后恢复
   const saved = readClientSettings().prefs || {};
   return {
@@ -146,6 +157,29 @@ function readAgentsDoc() {
     memory: memory || saved.memory || '',
     memoryEnabled,
   };
+}
+
+/** 迁移旧版 AGENTS.md（指引中含字面块标记的版本）为新格式。 */
+function migrateAgentsDoc() {
+  try {
+    const file = instructionsFile();
+    if (!fs.existsSync(file)) return;
+    const doc = readInstructions();
+    // 旧版特征：指引段落里出现字面块标记（与新格式的"标记为 dshup:memory 的注释块"描述不同）
+    const guideIdx = doc.indexOf('## 记忆机制（dshup 客户端）');
+    const hasOldGuide = guideIdx >= 0 && doc.indexOf('`<!-- dshup:memory -->`', guideIdx) >= 0;
+    if (!hasOldGuide) return;
+    const parsed = readAgentsDoc();
+    writeInstructions(renderAgentsDoc({
+      freePrompt: parsed.freePrompt,
+      preferences: parsed.preferencesText,
+      memory: parsed.memory,
+      memoryEnabled: parsed.memoryEnabled,
+    }));
+    console.log('[prefs] 已迁移旧版 AGENTS.md 格式');
+  } catch (e) {
+    console.error('[prefs] AGENTS.md 迁移失败:', e.message);
+  }
 }
 
 /** 偏好块文本 → 结构化对象（`- 回答语言：中文` 行）。 */
@@ -1175,6 +1209,7 @@ ipcMain.on('open-in-browser', () => {
 // 生命周期
 app.whenReady().then(() => {
   ensureAutoStart();
+  migrateAgentsDoc(); // 旧版 AGENTS.md 格式自动迁移（指引文本误含块标记的历史版本）
 
   // 语音输入：仅对本地页面（客户端自己的启动页/设置页与 dsh 内嵌页）放行麦克风权限
   try {

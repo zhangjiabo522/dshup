@@ -15,6 +15,25 @@ app.setPath(
   path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient', 'user-data')
 );
 
+// 冒烟测试用独立 userData：与正在运行的客户端共享 Chromium 配置目录会互相抢锁，
+// 导致渲染进程起不来（表现为页面永不加载、窗口随 window-all-closed 静默退出）。
+if (process.argv.includes('--smoke-test')) {
+  app.setPath('userData', path.join(os.tmpdir(), `dsh-smoke-user-data-${process.pid}`));
+}
+
+// 硬件加速开关：必须在 app ready 之前读取设置并调用（关闭 GPU 可显著省内存，部分老旧显卡可修复花屏）
+try {
+  if (JSON.parse(fs.readFileSync(
+    path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient', 'client-settings.json'),
+    'utf8',
+  )).hardwareAcceleration === false) {
+    app.disableHardwareAcceleration();
+    console.log('[main] 硬件加速已按设置关闭');
+  }
+} catch (e) {
+  /* 无设置文件或读取失败：保持默认开启 */
+}
+
 const SPLASH = path.join(__dirname, 'renderer', 'index.html');
 const SETTINGS_PAGE = path.join(__dirname, 'renderer', 'settings.html');
 
@@ -27,20 +46,38 @@ function clientSettingsFile() {
   return path.join(base, 'DeepSeekHarnessClient', 'client-settings.json');
 }
 
+// 注册表探测结果缓存 30 秒：readClientSettings 每次点击都会调用，reg 查询是
+// 同步阻塞调用，绝不能每个开关点击都付一次注册表查询延迟。
+let autoStartRegCache = { at: 0, value: false };
 function autoStartRegExists() {
-  if (process.platform !== 'win32') return false;
-  try {
-    const { execFileSync } = require('child_process');
-    const out = execFileSync('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'DeepSeek Harness'], { encoding: 'utf8', windowsHide: true, timeout: 8000 });
-    return /DeepSeek Harness/.test(out);
-  } catch (e) {
-    return false;
+  if (Date.now() - autoStartRegCache.at < 30000) return autoStartRegCache.value;
+  let found = false;
+  if (process.platform === 'win32') {
+    try {
+      const { execFileSync } = require('child_process');
+      const out = execFileSync('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'DeepSeek Harness'], { encoding: 'utf8', windowsHide: true, timeout: 8000 });
+      found = /DeepSeek Harness/.test(out);
+    } catch (e) {
+      found = false;
+    }
   }
+  autoStartRegCache = { at: Date.now(), value: found };
+  return found;
 }
 
 function readClientSettings() {
   // 未保存过时：开机自启默认沿用注册表现状，其余用默认值
-  const defaults = { autoStart: autoStartRegExists(), stopDshOnQuit: true };
+  const defaults = {
+    autoStart: autoStartRegExists(),
+    stopDshOnQuit: true,
+    notifyOnComplete: false,
+    closeToTray: false, // 关闭窗口时最小化到系统托盘（而非退出）
+    launchMinimized: false, // 启动后自动最小化到任务栏
+    hardwareAcceleration: true, // GPU 加速（关闭可省内存，重启生效）
+    mirror: 'npmmirror', // 依赖下载镜像：npmmirror（国内）| official（官方源）
+    proxyMode: 'auto', // 网络模式：auto（自动检测系统代理）| direct（直连，不走代理）
+    autoUpdateCheck: true, // 启动时静默检查新版本
+  };
   try {
     const raw = fs.readFileSync(clientSettingsFile(), 'utf8');
     return { ...defaults, ...JSON.parse(raw) };
@@ -223,6 +260,8 @@ function setAutoStartReg(enable) {
       /* 键不存在时忽略 */
     }
   }
+  // 写注册表后同步缓存，避免 30 秒内读设置仍返回旧值
+  autoStartRegCache = { at: Date.now(), value: !!enable };
 }
 
 const SMOKE = process.argv.includes('--smoke-test'); // 无人工验证模式：加载成功即退出
@@ -232,6 +271,8 @@ let win = null;
 let bootResult = null; // { url, alreadyRunning, process, stop }
 let booting = false;
 let userOpened = false; // 自启模式下用户是否主动打开过窗口
+let quitting = false; // 真正退出（托盘退出按钮置位，避免 closeToTray 拦截）
+let tray = null; // 系统托盘图标（常驻：关闭到托盘后从托盘恢复）
 
 // 自启模式日志（便于排查）
 function autoLog(line) {
@@ -326,6 +367,22 @@ function createWindow() {
   win.on('maximize', () => send('maximized-changed', true));
   win.on('unmaximize', () => send('maximized-changed', false));
 
+  // 关闭到托盘：真正退出（托盘菜单"退出"/before-quit）除外
+  win.on('close', (e) => {
+    if (!quitting && readClientSettings().closeToTray) {
+      e.preventDefault();
+      win.hide();
+      autoLog('关闭到托盘');
+    }
+  });
+
+  // 启动后自动最小化
+  if (readClientSettings().launchMinimized && !SMOKE) {
+    win.once('ready-to-show', () => {
+      try { win.minimize(); } catch (err) { /* ignore */ }
+    });
+  }
+
   if (SMOKE) {
     // 冒烟测试：内嵌页加载成功即退出（exit 0），超时/失败退出（exit 1）
     const shotIdx = process.argv.indexOf('--screenshot');
@@ -361,14 +418,31 @@ function createWindow() {
               // 系统设置
               const systemNav = [...dialog.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '系统设置');
               let systemInfo = null;
-              if (systemNav) { systemNav.click(); await sleep(600); systemInfo = { hasNotify: /任务完成时发送系统通知/.test(dialog.textContent || ''), hasAutoStart: /开机自动启动/.test(dialog.textContent || ''), hasStop: /关闭客户端时停止/.test(dialog.textContent || '') }; }
+              if (systemNav) { systemNav.click(); await sleep(600); const st = dialog.textContent || ''; systemInfo = { hasNotify: /任务完成时发送系统通知/.test(st), hasAutoStart: /开机自动启动/.test(st), hasStop: /关闭客户端时停止/.test(st), hasTray: /最小化到托盘/.test(st), hasMirror: /下载镜像/.test(st), hasProxy: /网络模式/.test(st), hasUpdate: /检查更新/.test(st), hasAccel: /硬件加速/.test(st) }; }
               // 个性化
               const personalNav = [...dialog.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '个性化');
               let personalInfo = null;
               if (personalNav) { personalNav.click(); await sleep(600); const pt = dialog.textContent || ''; personalInfo = { hasLanguage: /回答语言/.test(pt), hasStyle: /回答风格/.test(pt), hasMemory: /记忆功能/.test(pt), hasClear: /清空记忆/.test(pt), hasSave: /保存全部个性化设置/.test(pt) }; }
-              return { dialog: true, systemInfo, personalInfo };
+              // 数据与存储（目录体积统计异步较慢，轮询等待渲染）
+              const dataNav = [...dialog.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '数据与存储');
+              let dataInfo = null;
+              if (dataNav) { dataNav.click(); let dt = ''; for (let i = 0; i < 8; i++) { await sleep(1500); dt = dialog.textContent || ''; if (/运行时依赖目录/.test(dt)) break; } dataInfo = { hasRuntime: /运行时依赖目录/.test(dt), hasClear: /清理浏览器缓存/.test(dt), hasExport: /导出设置/.test(dt), hasImport: /导入设置/.test(dt) }; }
+              // 插件市场（插件列表经 GitHub API 异步加载，轮询等待）
+              const marketNav = [...dialog.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '插件市场');
+              let marketInfo = null;
+              if (marketNav) { marketNav.click(); let mt = ''; for (let i = 0; i < 8; i++) { await sleep(1500); mt = dialog.textContent || ''; if (/交给 AI 安装/.test(mt) || /插件列表获取失败/.test(mt)) break; } marketInfo = { hasMirror: /下载镜像/.test(mt), hasSpeedtest: /测速/.test(mt), hasList: /插件列表/.test(mt), hasInstall: /一键安装/.test(mt), hasAi: /交给 AI 安装/.test(mt), hasSearch: /搜索/.test(mt), hasPager: /下一页/.test(mt), hasMine: /我的插件/.test(mt), hasUninstall: /卸载/.test(mt) }; }
+              // 关于
+              const aboutNav = [...dialog.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '关于');
+              let aboutInfo = null;
+              if (aboutNav) { aboutNav.click(); await sleep(600); const at = dialog.textContent || ''; aboutInfo = { hasProduct: /桌面客户端/.test(at), hasUpdate: /检查更新/.test(at), hasLinks: /项目仓库/.test(at) }; }
+              return { dialog: true, systemInfo, personalInfo, dataInfo, marketInfo, aboutInfo };
             })()`);
             console.log('[prefs-check] ' + JSON.stringify(result));
+            try {
+              fs.writeFileSync(path.join(os.tmpdir(), 'dsh-prefs-check.json'), JSON.stringify(result, null, 2));
+            } catch (e) {
+              /* ignore */
+            }
             // instructions 结构化往返（保存后恢复原状）
             let orig = '';
             try {
@@ -989,6 +1063,493 @@ ipcMain.handle('settings:set', (_e, key, value) => {
   return next;
 });
 
+// 设置导出/导入（JSON 文件，经系统对话框选择路径）
+ipcMain.handle('settings:export', async () => {
+  try {
+    const { dialog } = require('electron');
+    const result = await dialog.showSaveDialog(win, {
+      title: '导出客户端设置',
+      defaultPath: 'dsh-client-settings.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+    fs.writeFileSync(result.filePath, JSON.stringify(readClientSettings(), null, 2));
+    return { ok: true, path: result.filePath };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+ipcMain.handle('settings:import', async () => {
+  try {
+    const { dialog } = require('electron');
+    const result = await dialog.showOpenDialog(win, {
+      title: '导入客户端设置',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+      properties: ['openFile'],
+    });
+    if (result.canceled || !result.filePaths[0]) return { ok: false, canceled: true };
+    const data = JSON.parse(fs.readFileSync(result.filePaths[0], 'utf8'));
+    if (typeof data !== 'object' || data === null) throw new Error('文件不是有效的设置 JSON');
+    const merged = { ...readClientSettings(), ...data };
+    fs.writeFileSync(clientSettingsFile(), JSON.stringify(merged, null, 2));
+    return { ok: true, settings: merged };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+
+// ---------------- 系统托盘 ----------------
+
+/** 显示/恢复主窗口（窗口被关掉后按启动流程重建）。 */
+function showWindow() {
+  if (!win || win.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  win.show();
+  win.focus();
+}
+
+/** 创建常驻托盘图标：左键双击显示窗口，菜单含显示/退出。 */
+function createTray() {
+  try {
+    const { Tray, Menu, nativeImage } = require('electron');
+    const raw = nativeImage.createFromPath(path.join(__dirname, 'assets', 'icon.ico'));
+    tray = new Tray(raw.resize({ width: 16, height: 16 }));
+    tray.setToolTip('DeepSeek Harness');
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: '显示 DeepSeek Harness', click: () => { showWindow(); } },
+      { type: 'separator' },
+      {
+        label: '退出',
+        click: () => {
+          quitting = true;
+          app.quit();
+        },
+      },
+    ]));
+    tray.on('double-click', () => { showWindow(); });
+  } catch (e) {
+    console.error('[tray] 托盘创建失败:', e.message);
+  }
+}
+
+// ---------------- 更新检查（GitHub Releases） ----------------
+
+/** 简化版语义化版本比较：a > b 返回正数。 */
+function compareVersions(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.').map(x => parseInt(x, 10) || 0);
+  const pb = String(b).replace(/^v/, '').split('.').map(x => parseInt(x, 10) || 0);
+  for (let i = 0; i < 3; i += 1) {
+    if (pa[i] !== pb[i]) return pa[i] - pb[i];
+  }
+  return 0;
+}
+
+/** 查 GitHub 最新 release（直连，超时容错；走代理时失败会返回 error 字段）。结果缓存 10 分钟。 */
+let updateCache = { at: 0, data: null };
+async function checkUpdate() {
+  if (updateCache.data !== null && Date.now() - updateCache.at < 600000) return updateCache.data;
+  const current = app.getVersion();
+  const base = { current, latest: '', url: 'https://github.com/zhangjiabo522/dshup/releases/latest', hasUpdate: false };
+  try {
+    const { net } = require('electron');
+    const request = net.request({
+      url: 'https://api.github.com/repos/zhangjiabo522/dshup/releases/latest',
+      headers: { Accept: 'application/vnd.github+json' },
+    });
+    const body = await new Promise((resolve, reject) => {
+      const chunks = [];
+      request.on('response', (res) => {
+        res.on('data', chunk => chunks.push(chunk));
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      });
+      request.on('error', reject);
+      request.end();
+    });
+    const data = JSON.parse(body);
+    const latest = String(data.tag_name || '').replace(/^v/, '');
+    if (!latest) return base;
+    const result = { ...base, latest, url: data.html_url || base.url, hasUpdate: compareVersions(latest, current) > 0 };
+    updateCache = { at: Date.now(), data: result };
+    return result;
+  } catch (e) {
+    return { ...base, error: String(e) };
+  }
+}
+
+ipcMain.handle('update:check', () => checkUpdate());
+ipcMain.handle('update:open', () => {
+  shell.openExternal('https://github.com/zhangjiabo522/dshup/releases/latest');
+});
+
+// ---------------- 插件市场（GitHub topic: dsh-plugin + 国内镜像加速） ----------------
+
+/** 可选下载镜像：直连 + 常见 GitHub 加速代理（测速后前端高亮最快）。 */
+const MARKET_MIRRORS = [
+  { id: 'direct', name: '直连（github.com）', prefix: '' },
+  { id: 'ghfast', name: 'ghfast.top', prefix: 'https://ghfast.top/' },
+  { id: 'ghproxy', name: 'gh-proxy.com', prefix: 'https://gh-proxy.com/' },
+  { id: 'ghproxy-net', name: 'mirror.ghproxy.com', prefix: 'https://mirror.ghproxy.com/' },
+  { id: 'ghdl', name: 'gh.ddlc.top', prefix: 'https://gh.ddlc.top/' },
+  { id: 'ghp', name: 'ghp.ci', prefix: 'https://ghp.ci/' },
+];
+
+/** 市场列表缓存（GitHub search API 未登录限流，按 查询词+页码 缓存 10 分钟）。 */
+const marketListCache = new Map();
+
+/** 带超时的 GET 文本请求（主进程全局 fetch）。 */
+async function fetchText(url, timeoutMs = 8000) {
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'dshup-market', Accept: 'application/vnd.github+json' },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.text();
+}
+
+/**
+ * 市场插件列表：GitHub topic:dsh-plugin（按 star 排序，分页 + 关键词搜索）。
+ * payload: { query?: string, page?: number }，每页 20 条；直连失败自动经镜像重试。
+ * GitHub 搜索 API 上限 1000 条，超过部分标记 hasMore 截断说明。
+ */
+ipcMain.handle('market:list', async (_e, payload) => {
+  const query = payload && typeof payload.query === 'string' ? payload.query.trim() : '';
+  const page = payload && Number.isInteger(payload.page) && payload.page >= 1 ? payload.page : 1;
+  const perPage = 20;
+  const key = `${query}|${page}`;
+  const cached = marketListCache.get(key);
+  if (cached !== undefined && Date.now() - cached.at < 600000) return cached.data;
+
+  const q = query === '' ? 'topic:dsh-plugin' : `${query} topic:dsh-plugin`;
+  const apiUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&page=${page}&per_page=${perPage}`;
+  const attempts = [
+    { name: '直连', url: apiUrl },
+    ...MARKET_MIRRORS.filter(m => m.prefix !== '').map(m => ({ name: m.name, url: m.prefix + apiUrl })),
+  ];
+  let lastErr = '';
+  for (const attempt of attempts) {
+    try {
+      const text = await fetchText(attempt.url, 10000);
+      const data = JSON.parse(text);
+      const items = (data.items || []).map(item => ({
+        fullName: item.full_name,
+        htmlUrl: item.html_url,
+        cloneUrl: item.clone_url,
+        description: item.description || '',
+        stars: item.stargazers_count || 0,
+        language: item.language || '',
+        defaultBranch: item.default_branch || 'main',
+      }));
+      const total = data.total_count || 0;
+      const capped = Math.min(total, 1000); // GitHub 搜索分页上限
+      const result = {
+        ok: true,
+        source: attempt.name,
+        query,
+        page,
+        perPage,
+        total,
+        capped,
+        totalPages: Math.max(1, Math.ceil(capped / perPage)),
+        hasMore: page * perPage < capped,
+        items,
+      };
+      marketListCache.set(key, { at: Date.now(), data: result });
+      return result;
+    } catch (e) {
+      lastErr = e && e.message ? e.message : String(e);
+    }
+  }
+  return {
+    ok: false,
+    error: `插件列表获取失败（直连与全部镜像均不可用）: ${lastErr}`,
+  };
+});
+
+/** 镜像测速：经每个镜像拉取一个小文件（dshup 的 package.json），返回延迟（ms）。 */
+ipcMain.handle('market:speedtest', async () => {
+  // dshup 仓库默认分支为 main（此前误用 master 导致全 404）
+  const target = 'https://github.com/zhangjiabo522/dshup/raw/main/package.json';
+  const results = [];
+  for (const mirror of MARKET_MIRRORS) {
+    const url = mirror.prefix === '' ? target : mirror.prefix + target;
+    let best = null;
+    for (let round = 0; round < 2; round++) {
+      const started = Date.now();
+      try {
+        const text = await fetchText(url, 8000);
+        const ms = Date.now() - started;
+        if (text.length < 50) throw new Error('响应过短');
+        if (best === null || ms < best) best = ms;
+      } catch (e) {
+        /* 该轮失败 */
+      }
+    }
+    results.push({ id: mirror.id, name: mirror.name, ok: best !== null, ms: best ?? null });
+  }
+  results.sort((a, b) => {
+    if (a.ok && !b.ok) return -1;
+    if (!a.ok && b.ok) return 1;
+    return (a.ms ?? Infinity) - (b.ms ?? Infinity);
+  });
+  const fastest = results.find(r => r.ok) ?? null;
+  return { ok: true, results, fastest };
+});
+
+/** 构建 `dsh plugin --profile web <args...>` 命令（优先本地源码 checkout 的 source runner，其次 PATH 上的 dsh）。 */
+function buildPluginCommand(args) {
+  const { detectCheckout, detectDshOnPath, detectNode } = require('./bootstrap');
+  const checkout = detectCheckout();
+  if (checkout && checkout.dir) {
+    const node = detectNode();
+    if (!node) throw new Error('未找到可用的 Node.js，无法执行插件管理命令');
+    return { command: `"${node}" --import tsx/esm apps/cli/src/bin.ts plugin --profile web ${args}`, cwd: checkout.dir };
+  }
+  const dshBin = detectDshOnPath();
+  if (!dshBin) throw new Error('未找到 dsh 命令：请先通过客户端完成环境准备');
+  return { command: `"${dshBin}" plugin --profile web ${args}`, cwd: os.homedir() };
+}
+
+/** 异步执行一条插件管理命令（临时 .cmd 避免 Windows 引号解析破坏），逐行转发进度。 */
+function runPluginCommand(command, cwd, sendLine) {
+  const { spawn } = require('child_process');
+  const bat = path.join(os.tmpdir(), `dsh-market-${process.pid}-${Date.now()}.cmd`);
+  fs.writeFileSync(bat, '@echo off\r\n' + command + '\r\n', 'utf8');
+  return new Promise((resolve, reject) => {
+    const child = spawn(resolveCmd(), ['/d', '/c', `"${bat}"`], {
+      cwd,
+      env: { ...process.env, PATH: withSanePath(process.env.PATH || '') },
+      windowsHide: false,
+      windowsVerbatimArguments: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const onData = buf => {
+      for (const line of buf.toString('utf8').split(/\r?\n/)) {
+        const clean = line.replace(/\s+$/, '');
+        if (clean !== '') sendLine(clean);
+      }
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    child.on('error', reject);
+    child.on('close', code => {
+      try { fs.unlinkSync(bat); } catch (e) { /* ignore */ }
+      resolve(code);
+    });
+  });
+}
+
+/** 插件安装：`dsh plugin --profile web add <镜像加速的 git 地址>`，异步 + 行级进度。 */
+let marketInstalling = false;
+ipcMain.handle('market:install', async (_e, payload) => {
+  if (marketInstalling) return { ok: false, error: '已有安装任务进行中，请稍候' };
+  const repo = payload && typeof payload.repo === 'string' ? payload.repo : '';
+  const mirrorId = payload && typeof payload.mirrorId === 'string' ? payload.mirrorId : '';
+  if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+/.test(repo)) {
+    return { ok: false, error: '仓库地址格式应为 https://github.com/<owner>/<repo>' };
+  }
+  const mirror = MARKET_MIRRORS.find(m => m.id === mirrorId) ?? MARKET_MIRRORS[0];
+  const spec = (mirror.prefix === '' ? repo : mirror.prefix + repo) + '.git';
+  const { withSanePath, resolveCmd } = require('./bootstrap');
+  let command = null;
+  let cwd = null;
+  try {
+    const plan = buildPluginCommand(`add ${spec}`);
+    command = plan.command;
+    cwd = plan.cwd;
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+  marketInstalling = true;
+  const sendLine = (line) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('market-install-progress', { line: String(line || '').slice(0, 200) });
+    }
+  };
+  try {
+    sendLine(`> 安装目标: ${spec}`);
+    sendLine(`> 镜像: ${mirror.name}`);
+    const exitCode = await runPluginCommand(command, cwd, sendLine);
+    if (exitCode === 0) {
+      sendLine('✓ 安装完成：重启 dsh 后生效');
+      return { ok: true, note: '安装完成，需要重启 dsh 生效' };
+    }
+    sendLine(`✗ 安装失败（退出码 ${exitCode}）：若提示 prepare 脚本被阻止，请在 profile 的 pnpm-workspace.yaml allowBuilds 放行后重试，或交给 AI 安装`);
+    return { ok: false, error: `安装失败（退出码 ${exitCode}），详见安装日志` };
+  } catch (e) {
+    sendLine('✗ 安装异常: ' + (e && e.message ? e.message : String(e)));
+    return { ok: false, error: String((e && e.message) || e) };
+  } finally {
+    marketInstalling = false;
+  }
+});
+
+/** 已安装插件列表：读取 $DSH_HOME/profiles/web/package.json 的依赖与 bundle 层。 */
+ipcMain.handle('market:installed', () => {
+  try {
+    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+    const file = path.join(home, 'profiles', 'web', 'package.json');
+    const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const dependencies = manifest.dependencies && typeof manifest.dependencies === 'object' ? manifest.dependencies : {};
+    const bundles = Array.isArray(manifest.dsh?.profile?.bundles) ? manifest.dsh.profile.bundles : [];
+    // 用户安装的插件 = dependencies 条目（模板 bundle 如 dsh-base 不在 dependencies 里）
+    const plugins = Object.keys(dependencies).map(name => ({
+      name,
+      version: typeof dependencies[name] === 'string' ? dependencies[name] : '',
+      inBundles: bundles.includes(name),
+    }));
+    return { ok: true, file, plugins };
+  } catch (e) {
+    return { ok: true, plugins: [], file: '' };
+  }
+});
+
+/** 卸载插件：`dsh plugin --profile web remove <name>`（pnpm 卸载 + bundle 层联动移除）。 */
+ipcMain.handle('market:uninstall', async (_e, payload) => {
+  if (marketInstalling) return { ok: false, error: '已有插件管理任务进行中，请稍候' };
+  const name = payload && typeof payload.name === 'string' ? payload.name.trim() : '';
+  if (name === '' || !/^[^/]+\/?[^/]+$/.test(name) || /[;&|<>]/.test(name)) {
+    return { ok: false, error: '插件名不合法' };
+  }
+  let command = null;
+  let cwd = null;
+  try {
+    const plan = buildPluginCommand(`remove ${name}`);
+    command = plan.command;
+    cwd = plan.cwd;
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+  marketInstalling = true;
+  const sendLine = (line) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('market-install-progress', { line: String(line || '').slice(0, 200) });
+    }
+  };
+  try {
+    sendLine(`> 卸载: ${name}`);
+    const exitCode = await runPluginCommand(command, cwd, sendLine);
+    if (exitCode === 0) {
+      sendLine('✓ 卸载完成：重启 dsh 后生效');
+      return { ok: true, note: '卸载完成，需要重启 dsh 生效' };
+    }
+    sendLine(`✗ 卸载失败（退出码 ${exitCode}）`);
+    return { ok: false, error: `卸载失败（退出码 ${exitCode}），详见日志` };
+  } catch (e) {
+    sendLine('✗ 卸载异常: ' + (e && e.message ? e.message : String(e)));
+    return { ok: false, error: String((e && e.message) || e) };
+  } finally {
+    marketInstalling = false;
+  }
+});
+
+// ---------------- 数据与存储 ----------------
+
+/** 递归目录体积（异常/不存在记 0）。逐目录异步遍历，每 20 个目录让出一次
+ *  事件循环——绝不长时间阻塞主进程（旧版 readdirSync recursive + 逐文件
+ *  statSync 曾一次锁死 UI 30-60 秒）。结果缓存 5 分钟。 */
+const sizeCache = new Map();
+async function dirSize(dir) {
+  const cached = sizeCache.get(dir);
+  if (cached !== undefined && Date.now() - cached.at < 300000) return cached.value;
+  let total = 0;
+  const stack = [dir];
+  let visited = 0;
+  try {
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      const entries = await fs.promises.readdir(cur, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(cur, entry.name);
+        if (entry.isDirectory()) stack.push(full);
+        else if (entry.isFile()) {
+          try {
+            total += fs.statSync(full).size;
+          } catch (e) {
+            /* 单文件权限问题忽略 */
+          }
+        }
+      }
+      visited += 1;
+      if (visited % 20 === 0) await new Promise(resolve => setImmediate(resolve));
+    }
+  } catch (e) {
+    /* 目录不可读：返回已统计部分 */
+  }
+  sizeCache.set(dir, { at: Date.now(), value: total });
+  return total;
+}
+
+/** 已缓存的目录体积（未计算过返回 0，绝不阻塞 data:info）。 */
+function dirSizeCached(dir) {
+  const cached = sizeCache.get(dir);
+  return cached !== undefined && Date.now() - cached.at < 300000 ? cached.value : 0;
+}
+
+/** 后台预热体积统计：启动与每次 data:info 后异步补算，界面先显示路径、体积随后就位。 */
+function warmDataSizes() {
+  const base = process.platform === 'win32'
+    ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient')
+    : path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeekHarnessClient');
+  const targets = [path.join(base, 'runtime'), path.join(base, 'funasr'), app.getPath('userData')];
+  return Promise.all(targets.map(target => dirSize(target).catch(() => 0)));
+}
+
+/** 客户端数据目录一览 + 体积（体积为后台计算的最新缓存值，未就绪时显示 0）。 */
+ipcMain.handle('data:info', () => {
+  const base = process.platform === 'win32'
+    ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient')
+    : path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeekHarnessClient');
+  const runtime = path.join(base, 'runtime');
+  const funasr = path.join(base, 'funasr');
+  const userData = app.getPath('userData');
+  const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  // 页面打开时若尚无缓存，后台补一次计算（下次打开即显示）
+  if (dirSizeCached(runtime) === 0 || dirSizeCached(funasr) === 0 || dirSizeCached(userData) === 0) {
+    void warmDataSizes();
+  }
+  const runtimeSize = dirSizeCached(runtime);
+  const funasrSize = dirSizeCached(funasr);
+  const userDataSize = dirSizeCached(userData);
+  return {
+    base,
+    settingsFile: clientSettingsFile(),
+    runtime,
+    funasr,
+    userData,
+    dshHome,
+    sizes: {
+      base: runtimeSize + funasrSize + userDataSize,
+      runtime: runtimeSize,
+      funasr: funasrSize,
+      userData: userDataSize,
+    },
+  };
+});
+
+/** 在资源管理器中打开目录。 */
+ipcMain.handle('data:open-dir', (_e, dir) => {
+  try {
+    if (typeof dir === 'string' && dir !== '') shell.openPath(dir);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+
+/** 清理 Electron 缓存（页面缓存/存储；不动 runtime/funasr/设置/会话）。 */
+ipcMain.handle('data:clear-cache', async () => {
+  try {
+    const { session } = require('electron');
+    await session.defaultSession.clearCache();
+    await session.defaultSession.clearStorageData();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+
 // 用户个性化（$DSH_HOME/AGENTS.md 结构化内容：偏好块 + 记忆块 + 自由提示词）
 ipcMain.handle('instructions:get', () => readAgentsDoc());
 ipcMain.handle('instructions:set', (_e, payload) => {
@@ -1029,27 +1590,79 @@ ipcMain.on('task-complete', () => {
   }
 });
 
-// 会话统计：用系统 Node（>=22.15 内置 node:zlib zstd）扫描 $DSH_HOME/sessions 聚合
+// 会话统计：用系统 Node（>=22.15 内置 node:zlib zstd）扫描 $DSH_HOME/sessions 聚合。
+// 性能设计：
+//  1. 脚本内部增量缓存（stats-cache.json，未变化文件跳过解码），稳定后单次扫描亚秒级；
+//  2. 快照秒开（stats-snapshot.json）：有快照立即返回旧数据，后台刷新完成后推送 stats-updated；
+//  3. 全异步 execFile，主进程永不阻塞。
 let statsCache = { at: 0, data: null };
-ipcMain.handle('stats:get', async () => {
+let statsScanning = false;
+
+function statsSnapshotFile() {
+  const base = process.platform === 'win32'
+    ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient')
+    : path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeekHarnessClient');
+  return path.join(base, 'stats-snapshot.json');
+}
+
+function readStatsSnapshot() {
   try {
-    if (statsCache.data !== null && Date.now() - statsCache.at < 60000) {
-      return statsCache.data;
-    }
-    const { detectNode } = require('./bootstrap');
-    const nodeExe = detectNode();
-    if (!nodeExe) return { available: false, reason: 'no-node' };
-    const { execFileSync } = require('child_process');
-    // asar 归档内路径无法被外部 node 直接执行：读出脚本内容经 stdin 传入 node
-    const script = fs.readFileSync(path.join(__dirname, 'stats-script.js'), 'utf8');
-    const out = execFileSync(nodeExe, ['-'], {
+    const data = JSON.parse(fs.readFileSync(statsSnapshotFile(), 'utf8'));
+    return data && data.available === true ? data : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function runStatsScan() {
+  const { detectNode } = require('./bootstrap');
+  const nodeExe = detectNode();
+  if (!nodeExe) return { available: false, reason: 'no-node' };
+  const { execFile } = require('child_process');
+  // asar 归档内路径无法被外部 node 直接执行：读出脚本内容经 stdin 传入 node
+  const script = fs.readFileSync(path.join(__dirname, 'stats-script.js'), 'utf8');
+  const out = await new Promise((resolve, reject) => {
+    execFile(nodeExe, ['-'], {
       input: script,
       encoding: 'utf8',
       timeout: 90000,
       maxBuffer: 64 * 1024 * 1024,
       windowsHide: true,
+    }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout);
     });
-    const data = JSON.parse(out);
+  });
+  return JSON.parse(out);
+}
+
+ipcMain.handle('stats:get', async () => {
+  try {
+    if (statsCache.data !== null && Date.now() - statsCache.at < 60000) {
+      return statsCache.data;
+    }
+    // 有历史快照：立即返回（界面秒开），后台补一次增量刷新，完成后推送给前端
+    const snapshot = readStatsSnapshot();
+    if (snapshot !== null) {
+      statsCache = { at: Date.now(), data: snapshot };
+      if (!statsScanning) {
+        statsScanning = true;
+        runStatsScan()
+          .then(data => {
+            if (data && data.available === true) {
+              statsCache = { at: Date.now(), data };
+              if (win && !win.isDestroyed()) {
+                win.webContents.send('stats-updated', data);
+              }
+            }
+          })
+          .catch(() => { /* 后台刷新失败保持快照数据 */ })
+          .finally(() => { statsScanning = false; });
+      }
+      return snapshot;
+    }
+    // 首次无快照：等待完整扫描
+    const data = await runStatsScan();
     statsCache = { at: Date.now(), data };
     return data;
   } catch (e) {
@@ -1258,7 +1871,16 @@ app.whenReady().then(() => {
   }
 
   createWindow();
+  createTray();
   runBootstrap();
+  void warmDataSizes(); // 后台预热数据目录体积统计（不阻塞启动）
+
+  // 启动时静默检查更新（失败静默，不打扰用户）
+  if (readClientSettings().autoUpdateCheck) {
+    checkUpdate().then((r) => {
+      if (r.hasUpdate) console.log(`[update] 发现新版本 ${r.latest}（当前 ${r.current}）: ${r.url}`);
+    }).catch(() => {});
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -1266,10 +1888,12 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  // 有托盘时窗口关闭不等于退出：仅当非"关闭到托盘"配置时退出
   app.quit();
 });
 
 app.on('before-quit', () => {
+  quitting = true;
   // 只有本客户端启动的服务且用户开启"关闭时停止"时才停止；用户原本就在运行的服务保持不动
   if (bootResult && bootResult.stop && !bootResult.alreadyRunning) {
     if (readClientSettings().stopDshOnQuit) {

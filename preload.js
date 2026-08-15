@@ -29,6 +29,32 @@ contextBridge.exposeInMainWorld('dshClient', {
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
     set: (key, value) => ipcRenderer.invoke('settings:set', key, value),
+    export: () => ipcRenderer.invoke('settings:export'),
+    import: () => ipcRenderer.invoke('settings:import'),
+  },
+  // 更新检查（GitHub Releases）
+  update: {
+    check: () => ipcRenderer.invoke('update:check'),
+    open: () => ipcRenderer.invoke('update:open'),
+  },
+  // 数据与存储（目录信息/打开/清理缓存）
+  data: {
+    info: () => ipcRenderer.invoke('data:info'),
+    openDir: (dir) => ipcRenderer.invoke('data:open-dir', dir),
+    clearCache: () => ipcRenderer.invoke('data:clear-cache'),
+  },
+  // 插件市场（GitHub topic:dsh-plugin + 镜像测速 + 一键安装 + 我的插件）
+  market: {
+    list: (payload) => ipcRenderer.invoke('market:list', payload || {}),
+    speedtest: () => ipcRenderer.invoke('market:speedtest'),
+    install: (payload) => ipcRenderer.invoke('market:install', payload),
+    installed: () => ipcRenderer.invoke('market:installed'),
+    uninstall: (payload) => ipcRenderer.invoke('market:uninstall', payload),
+    onInstallProgress: (cb) => {
+      const listener = (_event, payload) => cb(payload);
+      ipcRenderer.on('market-install-progress', listener);
+      return () => ipcRenderer.removeListener('market-install-progress', listener);
+    },
   },
   instructions: {
     get: () => ipcRenderer.invoke('instructions:get'),
@@ -37,6 +63,12 @@ contextBridge.exposeInMainWorld('dshClient', {
   notifyTaskComplete: () => ipcRenderer.send('task-complete'),
   stats: {
     get: () => ipcRenderer.invoke('stats:get'),
+    // 后台增量刷新完成 → 主进程推送最新统计（配合"快照秒开"刷新界面）
+    onUpdated: (cb) => {
+      const listener = (_event, data) => cb(data);
+      ipcRenderer.on('stats-updated', listener);
+      return () => ipcRenderer.removeListener('stats-updated', listener);
+    },
   },
   asr: {
     config: {

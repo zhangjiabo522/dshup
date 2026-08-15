@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const http = require('http');
-const { spawn, execFileSync } = require('child_process');
+const { spawn } = require('child_process');
 
 const BASE = () => {
   const base =
@@ -118,20 +118,30 @@ if __name__ == '__main__':
 
 // ---------------- 基础检测 ----------------
 
-function run(exe, args, opts = {}) {
-  const res = execFileSync(exe, args, {
-    encoding: 'utf8',
-    windowsHide: true,
-    timeout: opts.timeout || 120000,
-    maxBuffer: 16 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
+/** 异步执行命令（promisified execFile）—— 主进程绝不因探测/安装命令阻塞（UI 无响应的主要来源）。 */
+function runAsync(exe, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const { execFile } = require('child_process');
+    execFile(exe, args, {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: opts.timeout || 120000,
+      maxBuffer: 16 * 1024 * 1024,
+    }, (err, stdout) => {
+      if (err) {
+        const e = new Error(String((err && err.message) || err));
+        e.stdout = stdout;
+        reject(e);
+      } else {
+        resolve(stdout || '');
+      }
+    });
   });
-  return res || '';
 }
 
-function tryRun(exe, args, opts = {}) {
+async function tryRunAsync(exe, args, opts = {}) {
   try {
-    return { ok: true, out: run(exe, args, opts) };
+    return { ok: true, out: await runAsync(exe, args, opts) };
   } catch (e) {
     return { ok: false, out: String((e && e.stdout) || (e && e.message) || e) };
   }
@@ -228,18 +238,18 @@ function pythonOk(v) {
   return v.major === 3 && v.minor >= 8 && v.minor <= 11;
 }
 
-function versionOf(exe) {
+async function versionOfAsync(exe) {
   try {
-    const out = execFileSync(exe, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    const out = await runAsync(exe, ['--version'], { timeout: 20000 });
     return parsePythonVersion(out);
   } catch (e) {
     return null;
   }
 }
 
-function findPython() {
+async function findPython() {
   // 1) 部署目录 venv 自带且版本兼容
-  if (fs.existsSync(VENV_PY()) && pythonOk(versionOf(VENV_PY()))) return VENV_PY();
+  if (fs.existsSync(VENV_PY()) && pythonOk(await versionOfAsync(VENV_PY()))) return VENV_PY();
   // 2) 常见安装路径直接探测（不依赖 PATH / py launcher / winget）
   const candidates = [];
   if (process.platform === 'win32') {
@@ -256,21 +266,21 @@ function findPython() {
     candidates.push('/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3');
   }
   for (const c of candidates) {
-    if (fs.existsSync(c) && pythonOk(versionOf(c))) return c;
+    if (fs.existsSync(c) && pythonOk(await versionOfAsync(c))) return c;
   }
   // 3) 系统 PATH 上的 python（3.8-3.11 才接受）
-  const sysPy = tryRun(process.platform === 'win32' ? 'where.exe' : '/usr/bin/which', [process.platform === 'win32' ? 'python.exe' : 'python3'], { timeout: 15000 });
+  const sysPy = await tryRunAsync(process.platform === 'win32' ? 'where.exe' : '/usr/bin/which', [process.platform === 'win32' ? 'python.exe' : 'python3'], { timeout: 15000 });
   if (sysPy.ok) {
     const line = (sysPy.out || '').split(/\r?\n/).map(s => s.trim()).find(s => s && (s.toLowerCase().endsWith('.exe') || s.includes('/')));
-    if (line && pythonOk(versionOf(line))) return line;
+    if (line && pythonOk(await versionOfAsync(line))) return line;
   }
   // 4) py launcher（仅 Windows）指定版本
   if (process.platform === 'win32') {
     for (const v of ['3.11', '3.10', '3.9', '3.8']) {
-      const r = tryRun('py.exe', ['-' + v, '-c', 'import sys; print(sys.executable)'], { timeout: 20000 });
+      const r = await tryRunAsync('py.exe', ['-' + v, '-c', 'import sys; print(sys.executable)'], { timeout: 20000 });
       if (r.ok && r.out.trim()) {
         const exe = r.out.trim();
-        if (pythonOk(versionOf(exe))) return exe;
+        if (pythonOk(await versionOfAsync(exe))) return exe;
       }
     }
   }
@@ -328,14 +338,14 @@ async function deploy(opts = {}) {
   fs.mkdirSync(base, { recursive: true });
 
   // 1) Python（funasr/torch 生态要求 3.8-3.11；3.12+ 缺 wheel 会被自动排除）
-  let python = findPython();
+  let python = await findPython();
   if (!python) {
     if (process.platform === 'win32') {
       const winget = wingetExe();
       if (winget !== null) {
         onProgress({ type: 'step', message: '未检测到兼容的 Python（需 3.8-3.11），正在通过 winget 自动安装 Python 3.11…' });
-        tryRun(winget, ['install', '-e', '--id', 'Python.Python.3.11', '--silent', '--accept-package-agreements', '--accept-source-agreements'], { timeout: 900000 });
-        python = findPython();
+        await tryRunAsync(winget, ['install', '-e', '--id', 'Python.Python.3.11', '--silent', '--accept-package-agreements', '--accept-source-agreements'], { timeout: 900000 });
+        python = await findPython();
       }
     }
     if (!python) {
@@ -349,7 +359,7 @@ async function deploy(opts = {}) {
   onProgress({ type: 'step', message: 'Python: ' + python });
 
   // 2) venv（版本不兼容的旧 venv 自动重建，避免用 3.12+ 继续失败）
-  if (fs.existsSync(VENV_PY()) && !pythonOk(versionOf(VENV_PY()))) {
+  if (fs.existsSync(VENV_PY()) && !pythonOk(await versionOfAsync(VENV_PY()))) {
     onProgress({ type: 'step', message: '旧虚拟环境 Python 版本不兼容，重建中…' });
     try {
       fs.rmSync(path.join(base, 'venv'), { recursive: true, force: true });
@@ -359,7 +369,7 @@ async function deploy(opts = {}) {
   }
   if (!fs.existsSync(VENV_PY())) {
     onProgress({ type: 'step', message: '创建独立虚拟环境…' });
-    const r = tryRun(python, ['-m', 'venv', path.join(base, 'venv')], { timeout: 300000 });
+    const r = await tryRunAsync(python, ['-m', 'venv', path.join(base, 'venv')], { timeout: 300000 });
     if (!r.ok) throw new Error('创建虚拟环境失败: ' + r.out);
   }
 
@@ -396,7 +406,7 @@ async function deploy(opts = {}) {
       throw new Error('PyTorch 安装失败: ' + e.message);
     }
     // 安装后验证 torch 可导入（防止半截安装被误判成功）
-    const torchCheck = tryRun(venvPy, ['-c', 'import torch; print(torch.__version__)'], { timeout: 120000 });
+    const torchCheck = await tryRunAsync(venvPy, ['-c', 'import torch; print(torch.__version__)'], { timeout: 120000 });
     if (!torchCheck.ok) {
       throw new Error('PyTorch 安装后验证失败（import torch 出错）: ' + tailLines(torchCheck.out, 5));
     }
@@ -471,22 +481,22 @@ async function stop() {
   try {
     if (process.platform === 'win32') {
       const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-      const out = run(ps, ['-NoProfile', '-Command', `(Get-NetTCPConnection -LocalPort ${DEFAULT_PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess`], { timeout: 20000 });
+      const out = await runAsync(ps, ['-NoProfile', '-Command', `(Get-NetTCPConnection -LocalPort ${DEFAULT_PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess`], { timeout: 20000 });
       const pid = parseInt(out.trim(), 10);
       if (Number.isFinite(pid) && pid > 0) {
         try {
-          run('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { timeout: 20000 });
+          await runAsync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { timeout: 20000 });
         } catch (e) {
           /* ignore */
         }
       }
     } else {
       // macOS：lsof 找到监听进程并 kill
-      const out = run('/usr/sbin/lsof', ['-ti', `tcp:${DEFAULT_PORT}`], { timeout: 20000 });
+      const out = await runAsync('/usr/sbin/lsof', ['-ti', `tcp:${DEFAULT_PORT}`], { timeout: 20000 });
       const pid = parseInt(String(out || '').trim().split(/\s+/)[0], 10);
       if (Number.isFinite(pid) && pid > 0) {
         try {
-          run('/bin/kill', ['-TERM', String(pid)], { timeout: 20000 });
+          await runAsync('/bin/kill', ['-TERM', String(pid)], { timeout: 20000 });
         } catch (e) {
           /* ignore */
         }

@@ -22,12 +22,47 @@ const tls = require('tls');
 const PORT = 3080;
 const APP_URL = `http://127.0.0.1:${PORT}/`;
 const NPM_MIRROR = 'https://registry.npmmirror.com';
+const NPM_OFFICIAL = 'https://registry.npmjs.org';
 const NODE_MIRROR = 'https://npmmirror.com/mirrors/node';
+const NODE_OFFICIAL = 'https://nodejs.org/dist';
 const NODE_LTS_MAJOR = 22; // 需要私有安装时使用的 LTS 大版本（npmmirror 镜像）
 const PNPM_VERSION = '11.7.0'; // 与 deepseek-harness 仓库 packageManager 一致
-const DSH_PACKAGE = '@deepseek-ai/dsh';
+const DSH_PACKAGE = '@deepseek-ai/dsh@0.1.0-rc.6'; // 官方 npm 最新稳定 rc（私有目录安装，不影响用户全局）
 const MAX_POLL_MS = 180000; // 等待 dsh 启动的最长时间
 const POLL_INTERVAL_MS = 1200;
+
+// ---------------- 客户端设置感知（镜像源 / 网络模式） ----------------
+// 设置文件与主进程共用：%LOCALAPPDATA%\DeepSeekHarnessClient\client-settings.json
+// （macOS：~/Library/Application Support/DeepSeekHarnessClient/client-settings.json）
+
+function clientSettingsFile() {
+  const base = IS_WIN
+    ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+    : path.join(os.homedir(), 'Library', 'Application Support');
+  return path.join(base, 'DeepSeekHarnessClient', 'client-settings.json');
+}
+
+function readClientSettings() {
+  try {
+    const data = JSON.parse(fs.readFileSync(clientSettingsFile(), 'utf8'));
+    return data && typeof data === 'object' ? data : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+/** 当前下载镜像：官方源 / 国内镜像（npmmirror）。 */
+function mirrors() {
+  if (readClientSettings().mirror === 'official') {
+    return { npm: NPM_OFFICIAL, node: NODE_OFFICIAL };
+  }
+  return { npm: NPM_MIRROR, node: NODE_MIRROR };
+}
+
+/** 网络模式：direct（直连，跳过系统代理）或 auto（自动检测系统代理）。 */
+function proxyAllowed() {
+  return readClientSettings().proxyMode !== 'direct';
+}
 
 // 平台分支：Windows（cmd/where/注册表）与 macOS（sh/which/launchd 由 Electron API 处理）
 const IS_WIN = process.platform === 'win32';
@@ -258,6 +293,7 @@ function detectProxy() {
 }
 
 function proxyArgs() {
+  if (!proxyAllowed()) return '';
   const p = detectProxy();
   return p ? ` --proxy="${p}" --https-proxy="${p}"` : '';
 }
@@ -354,7 +390,7 @@ async function requestFollowRedirects(url, opts, useProxy, maxRedirects = 5) {
 }
 
 async function download(url, dest, emit) {
-  const proxy = detectProxy();
+  const proxy = proxyAllowed() ? detectProxy() : null;
   const attempts = proxy ? [proxy, null] : [null];
   const headers = { 'User-Agent': 'dsh-windows-client/1.0', Accept: '*/*' };
   let lastErr = null;
@@ -459,7 +495,7 @@ function nodeVersionOk(v) {
 }
 
 async function httpGetJson(url, timeout = 20000) {
-  const proxy = detectProxy();
+  const proxy = proxyAllowed() ? detectProxy() : null;
   const attempts = proxy ? [proxy, null] : [null];
   const headers = { 'User-Agent': 'dsh-windows-client/1.0', Accept: '*/*' };
   let lastErr = null;
@@ -599,7 +635,7 @@ async function installNode(onEvent) {
   // 从 npmmirror 的 index.json 取最新的 v22.x LTS
   let version = `v${NODE_LTS_MAJOR}.19.0`;
   try {
-    const idx = await httpGetJson(`${NODE_MIRROR}/index.json`);
+    const idx = await httpGetJson(`${mirrors().node}/index.json`);
     const candidates = idx
       .filter((e) => e.version && e.version.startsWith(`v${NODE_LTS_MAJOR}.`))
       .sort((a, b) => {
@@ -622,7 +658,7 @@ async function installNode(onEvent) {
     const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
     zipName = `node-${version}-darwin-${arch}.tar.gz`;
   }
-  const url = `${NODE_MIRROR}/${version}/${zipName}`;
+  const url = `${mirrors().node}/${version}/${zipName}`;
   const zipFile = path.join(rt, zipName);
   emit('progress', { pct: 0, message: `下载 ${zipName}…` });
   await download(url, zipFile, emit);
@@ -659,7 +695,7 @@ async function installPnpm(nodeExe, onEvent) {
   let lastErr = null;
   try {
     // 异步执行 + 实时进度（不阻塞主进程，避免新环境首启"无响应"）
-    await runCmdAsync(`"${npmCmd}" install --prefix "${rt}" pnpm@${PNPM_VERSION} --registry=${NPM_MIRROR} --no-audit --no-fund${proxyArgs()}`, {
+    await runCmdAsync(`"${npmCmd}" install --prefix "${rt}" pnpm@${PNPM_VERSION} --registry=${mirrors().npm} --no-audit --no-fund${proxyArgs()}`, {
       timeout: 300000,
       onLine: progressRelay(line => {
         emit('progress', { message: line.slice(0, 160) });
@@ -687,7 +723,7 @@ async function installDsh(nodeExe, onEvent) {
   let lastErr = null;
   try {
     // 异步执行 + 实时进度（不阻塞主进程，避免新环境首启"无响应"）
-    await runCmdAsync(`"${npmCmd}" install --prefix "${rt}" ${DSH_PACKAGE} --registry=${NPM_MIRROR} --no-audit --no-fund${proxyArgs()}`, {
+    await runCmdAsync(`"${npmCmd}" install --prefix "${rt}" ${DSH_PACKAGE} --registry=${mirrors().npm} --no-audit --no-fund${proxyArgs()}`, {
       timeout: 600000,
       onLine: progressRelay(line => {
         emit('progress', { message: line.slice(0, 160) });
@@ -861,4 +897,6 @@ module.exports = {
   unzip,
   flattenDir,
   download,
+  resolveCmd,
+  withSanePath,
 };

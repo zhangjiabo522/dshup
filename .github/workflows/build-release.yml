@@ -1,15 +1,14 @@
-# 打 tag（v*）时在 Windows / macOS 构建机分别构建安装包并发布 GitHub Release
 name: build-release
 
 on:
   push:
-    tags:
-      - 'v*'
-  # 手动触发：只构建 + 冒烟测试，不发布（用于验证工作流改动）
+    branches: [main]
+    tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -18,12 +17,27 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            args: --win nsis
-            name: windows
-          - os: macos-latest
-            args: --mac dmg zip
-            name: macos
+            args: --win nsis --x64
+            name: windows-x64
+            publish: true
+          - os: macos-15
+            args: --mac dmg zip --arm64
+            name: macos-arm64
+            publish: true
+          - os: macos-15-intel
+            args: --mac dmg zip --x64
+            name: macos-x64
+            publish: true
+          - os: ubuntu-22.04
+            args: --linux deb --x64
+            name: ubuntu-22.04-amd64
+            publish: true
+          - os: ubuntu-24.04
+            args: --linux deb --x64
+            name: ubuntu-24.04-amd64
+            publish: false
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -32,65 +46,112 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: Remove CN mirror config (CI runners are overseas)
-        run: node -e "try{require('fs').unlinkSync('.npmrc')}catch(e){}"
+      - name: 使用官方构建下载源
+        run: node -e "const fs=require('fs'); fs.rmSync('.npmrc', {force:true}); const lock=JSON.parse(fs.readFileSync('package-lock.json','utf8')); for(const p of Object.values(lock.packages)) if(p.resolved) p.resolved=p.resolved.replace('https://registry.npmmirror.com/','https://registry.npmjs.org/'); fs.writeFileSync('package-lock.json',JSON.stringify(lock,null,2))"
 
-      - name: Install dependencies
+      - name: 安装依赖
         run: npm ci --no-audit --no-fund
 
-      - name: Build
-        # --publish never：禁用 tag 触发的隐式发布（发布由下方 action-gh-release 完成）
+      - name: 桌面平台测试
+        run: npm run test:desktop
+
+      - name: 隔离引导与认证回归检查
+        if: runner.os != 'Windows'
+        run: npm run test:bootstrap
+
+      - name: 构建安装包
         run: node node_modules/electron-builder/out/cli/cli.js ${{ matrix.args }} --publish never
         env:
-          # CI 构建机在海外：直接用官方源下载 Electron/工具链
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
-      - name: Smoke test (全新机首启：静默安装 + 启动 20 秒不崩溃)
-        if: matrix.name == 'windows'
+      - name: Windows 安装及首启存活检查
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $setup = Get-ChildItem release\dshup-Setup-*.exe | Select-Object -First 1
-          if (-not $setup) { Write-Output "未找到安装包"; exit 1 }
-          Write-Output "静默安装 $($setup.FullName)"
+          if (-not $setup) { throw '未找到安装包' }
           Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait
           $exe = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\DeepSeek Harness.exe"
-          if (-not (Test-Path $exe)) { Write-Output "安装后未找到 $exe"; exit 1 }
+          if (-not (Test-Path $exe)) { throw "安装后未找到 $exe" }
           $p = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 20
-          if ($p.HasExited) { Write-Output "首启 20 秒内退出，退出码 $($p.ExitCode)"; exit 1 }
-          Write-Output "首启存活 20 秒，冒烟通过"
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          try {
+            Start-Sleep -Seconds 20
+            if ($p.HasExited) { throw "首启 20 秒内退出，退出码 $($p.ExitCode)" }
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
 
-      - name: Smoke test (全新机首启：启动 .app 20 秒不崩溃)
-        if: matrix.name == 'macos'
+      - name: macOS 首启存活检查
+        if: runner.os == 'macOS'
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           APP=$(find release -maxdepth 2 -name '*.app' -type d | head -n 1)
-          [ -n "$APP" ] || { echo "未找到 .app"; exit 1; }
-          echo "冒烟目标: $APP"
-          # 直接执行 Mach-O 二进制：产物未签名/未公证，绕开 Gatekeeper 隔离
-          EXE_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Contents/Info.plist")
+          test -n "$APP"
+          EXE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")
           "$APP/Contents/MacOS/$EXE_NAME" > /tmp/dshup-smoke.log 2>&1 &
           PID=$!
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
           sleep 20
-          if kill -0 "$PID" 2>/dev/null; then
-            echo "首启存活 20 秒，冒烟通过"
-            kill "$PID" 2>/dev/null || true
-            wait "$PID" 2>/dev/null || true
-          else
-            echo "首启 20 秒内退出，日志如下："
+          if ! kill -0 "$PID" 2>/dev/null; then
             cat /tmp/dshup-smoke.log
             exit 1
           fi
-          tail -n 30 /tmp/dshup-smoke.log || true
 
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+      - name: 安装 Ubuntu 安装包与虚拟显示依赖
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y xvfb dbus-x11 ./release/*.deb
+          test -x '/opt/DeepSeek Harness/dshup'
+          test -f '/opt/DeepSeek Harness/resources/apparmor-profile'
+          if test -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns && test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1; then
+            sudo test -f /etc/apparmor.d/dshup
+            sudo apparmor_parser --skip-kernel-load /etc/apparmor.d/dshup
+          fi
+
+      - name: Ubuntu 隔离启动及令牌认证检查
+        if: runner.os == 'Linux'
+        run: xvfb-run -a dbus-run-session -- npm run test:smoke:linux
+
+      - name: 保存待发布产物
+        if: matrix.publish
+        uses: actions/upload-artifact@v4
         with:
-          generate_release_notes: true
-          files: |
+          name: release-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
             release/*.exe
             release/*.exe.blockmap
             release/*.dmg
             release/*.zip
+            release/*.deb
+
+      - name: 保存 Ubuntu 24.04 验证产物
+        if: matrix.publish == false
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-${{ matrix.name }}
+          path: release/*.deb
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*

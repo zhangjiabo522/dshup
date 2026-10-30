@@ -1,35 +1,261 @@
-// test-bootstrap.js — 无界面测试：验证检测逻辑与"已在运行"分支（不会启动第二个 dsh 实例）
 'use strict';
 
-const {
-  bootstrap,
-  isServerUp,
-  detectNode,
-  detectPnpm,
-  detectCheckout,
-  detectDshOnPath,
-  runtimeDir,
-} = require('./bootstrap');
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const http = require('node:http');
+const net = require('node:net');
+const html = '<!doctype html><script>window.__DSH_BOOT__ = {};</script>';
+const fixtureScript = path.join(__dirname, 'test', 'fixtures', 'fake-dsh.cjs');
+const envKeys = ['HOME', 'USERPROFILE', 'LOCALAPPDATA', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'DSH_HOME', 'DSH_CHECKOUT', 'DSH_PORT', 'PATH', 'DSH_TEST_STATE', 'DSH_TEST_SCENARIO'];
 
-(async () => {
-  console.log('=== 环境检测 ===');
-  console.log('node     :', detectNode() || '(未检测到可用 Node)');
-  console.log('pnpm     :', detectPnpm() || '(未检测到 pnpm)');
-  console.log('checkout :', JSON.stringify(detectCheckout()));
-  console.log('dsh PATH :', detectDshOnPath() || '(PATH 无 dsh)');
-  console.log('runtime  :', runtimeDir());
-  console.log('3080 监听:', await isServerUp());
-
-  console.log('\n=== 引导流程（应命中"已在运行"分支） ===');
-  const result = await bootstrap({
-    onEvent: (ev) => console.log(`  [${ev.type}] ${ev.message || ''}`),
+async function listen(server, port = 0) {
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', resolve);
   });
-  console.log('\n=== 结果 ===');
-  console.log('url           :', result.url);
-  console.log('alreadyRunning:', result.alreadyRunning);
-  console.log('process       :', result.process ? `pid=${result.process.pid}` : null);
-  process.exit(result.url && result.alreadyRunning === true ? 0 : 1);
-})().catch((e) => {
-  console.error('测试失败:', e);
-  process.exit(1);
+  return server.address().port;
+}
+
+async function close(server) {
+  server.closeAllConnections?.();
+  await new Promise((resolve) => server.close(resolve));
+}
+
+async function withFixture(scenario, fn) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dshup-启动验证-'));
+  const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  const reservation = net.createServer();
+  const port = await listen(reservation);
+  await close(reservation);
+  const home = path.join(root, 'home with $space');
+  fs.mkdirSync(home, { recursive: true });
+  Object.assign(process.env, {
+    HOME: home, USERPROFILE: home, LOCALAPPDATA: path.join(root, 'local'),
+    XDG_DATA_HOME: path.join(root, 'data'), XDG_CONFIG_HOME: path.join(root, 'config'), XDG_CACHE_HOME: path.join(root, 'cache'),
+    DSH_HOME: path.join(root, 'dsh'), DSH_CHECKOUT: path.join(root, 'absent-checkout'),
+    DSH_PORT: String(port), DSH_TEST_STATE: root, DSH_TEST_SCENARIO: scenario, PATH: '',
+  });
+  delete require.cache[require.resolve('./bootstrap')];
+  const api = require('./bootstrap');
+  const node = path.join(api.runtimeDir(), 'node', 'bin', 'node');
+  fs.mkdirSync(path.dirname(node), { recursive: true });
+  fs.symlinkSync(process.execPath, node);
+  const bin = api.privateDshBin();
+  fs.mkdirSync(path.dirname(bin), { recursive: true });
+  const wrapper = scenario === 'shell'
+    ? `#!/bin/sh\nexec node '${fixtureScript.replace(/'/g, "'\\''")}' "$@"\n`
+    : `#!/usr/bin/env node\nrequire(${JSON.stringify(fixtureScript)});\n`;
+  fs.writeFileSync(bin, wrapper, { mode: 0o755 });
+  const results = [];
+  const start = async (opts = {}) => {
+    const result = await api.bootstrap({ startupTimeoutMs: 2500, authTimeoutMs: 2000, ...opts });
+    results.push(result);
+    return result;
+  };
+  try {
+    await fn({ api, root, port, start });
+  } finally {
+    for (const result of results) await result.stop();
+    for (const key of envKeys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    delete require.cache[require.resolve('./bootstrap')];
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function state(root, name) {
+  return JSON.parse(fs.readFileSync(path.join(root, name), 'utf8'));
+}
+
+async function assertStopped(pid) {
+  for (let i = 0; i < 30; i += 1) {
+    try { process.kill(pid, 0); } catch (error) {
+      if (error.code === 'ESRCH') return;
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail(`测试进程 ${pid} 未退出`);
+}
+
+async function externalService(handler, verify) {
+  await withFixture('unused', async (fixture) => {
+    const server = http.createServer(handler);
+    await listen(server, fixture.port);
+    try { await verify(fixture); } finally { await close(server); }
+  });
+}
+
+test('启动与认证在隔离目录和回环网络中验证', { skip: process.platform === 'win32' }, async (t) => {
+  await t.test('XDG 数据目录只接受绝对路径', { skip: process.platform !== 'linux' }, async () => {
+    await withFixture('unused', async ({ api, root }) => {
+      const fallback = path.join(process.env.HOME, '.local', 'share', 'DeepSeekHarnessClient');
+      for (const value of ['', 'relative-data', './data', '../data']) {
+        process.env.XDG_DATA_HOME = value;
+        assert.equal(api.clientBaseDir(), fallback);
+      }
+      delete process.env.XDG_DATA_HOME;
+      assert.equal(api.clientBaseDir(), fallback);
+      process.env.XDG_DATA_HOME = path.join(root, 'absolute-data');
+      assert.equal(api.clientBaseDir(), path.join(root, 'absolute-data', 'DeepSeekHarnessClient'));
+    });
+  });
+  await t.test('旧版没有令牌仍正常启动，停止不影响其他服务', async () => {
+    await withFixture('old', async ({ api, port, root, start }) => {
+      const other = http.createServer((req, res) => res.end('其他服务'));
+      const otherPort = await listen(other);
+      try {
+        const result = await start();
+        assert.equal(result.url, `http://127.0.0.1:${port}/`);
+        assert.equal(result.alreadyRunning, false);
+        assert.equal(result.launchUrl, null);
+        assert.deepEqual(result.cookies, []);
+        assert.equal(state(root, 'starts.json').length, 1);
+        assert.ok(fs.existsSync(path.join(process.env.DSH_HOME, 'profiles', 'web', 'cordis.patch.yml')));
+        await result.stop();
+        await result.stop();
+        await assertStopped(result.process.pid);
+        assert.equal(await api.isServerUp(port), false);
+        assert.equal(await api.isServerUp(otherPort), true);
+      } finally { await close(other); }
+    });
+  });
+  await t.test('分块输出令牌只消费一次，日志不泄露令牌', async () => {
+    await withFixture('auth', async ({ api, root, start }) => {
+      const events = [];
+      const result = await start({ onEvent: (event) => events.push(event.message) });
+      assert.equal(result.launchUrl, null);
+      assert.equal(result.token, null);
+      assert.equal(result.browserUrl, `${api.APP_URL}?token=launch_token_1_secret`);
+      assert.match(result.cookies[0], /^dsh_session=session_1;/);
+      assert.equal(await api.htmlHasDshupPlugin({ cookies: result.cookies }), true);
+      assert.deepEqual(state(root, 'token-uses.json'), ['launch_token_1_secret']);
+      assert.equal(events.join('\n').includes('launch_token_1_secret'), false);
+      assert.ok(events.some((message) => message.includes('[已隐藏]')));
+    });
+  });
+  for (const scenario of ['warming-old', 'warming-auth', 'warming-after-auth']) {
+    await t.test(`临时响应会等待真正页面就绪：${scenario}`, async () => {
+      await withFixture(scenario, async ({ root, api, start }) => {
+        const result = await start();
+        assert.equal(await api.htmlHasDshupPlugin({ cookies: result.cookies }), true);
+        assert.equal(state(root, 'starts.json').length, 1);
+        const expected = scenario === 'warming-after-auth' ? [503, 404, 200] : [404, 503, 200];
+        assert.deepEqual(state(root, 'transient-responses.json'), expected);
+        if (scenario !== 'warming-old') {
+          assert.match(result.cookies[0], /^dsh_session=session_1;/);
+          assert.deepEqual(state(root, 'token-uses.json'), ['launch_token_1_secret']);
+        }
+      });
+    });
+  }
+  for (const scenario of ['never-ready', 'never-ready-after-auth']) {
+    await t.test(`持续未就绪时给出页面超时并清理进程：${scenario}`, async () => {
+      await withFixture(scenario, async ({ root, start }) => {
+        const status = scenario === 'never-ready' ? 503 : 200;
+        await assert.rejects(start({ startupTimeoutMs: 700 }), new RegExp(`页面就绪超时.*HTTP ${status}`));
+        await assertStopped(state(root, 'starts.json')[0].pid);
+        if (scenario === 'never-ready-after-auth') {
+          assert.deepEqual(state(root, 'token-uses.json'), ['launch_token_1_secret']);
+        }
+      });
+    });
+  }
+  await t.test('Cookie 未生效与页面尚未就绪分别报错', async () => {
+    await withFixture('invalid-cookie', async ({ root, start }) => {
+      await assert.rejects(start({ startupTimeoutMs: 700 }), /浏览器授权未生效（HTTP 401）/);
+      await assertStopped(state(root, 'starts.json')[0].pid);
+      assert.deepEqual(state(root, 'token-uses.json'), ['launch_token_1_secret']);
+    });
+  });
+  await t.test('插件重启使用新令牌与新 Cookie', async () => {
+    await withFixture('restart', async ({ root, start }) => {
+      const result = await start();
+      const starts = state(root, 'starts.json');
+      assert.equal(starts.length, 2);
+      await assertStopped(starts[0].pid);
+      assert.match(result.cookies[0], /^dsh_session=session_2;/);
+      assert.deepEqual(state(root, 'token-uses.json'), ['launch_token_1_secret', 'launch_token_2_secret']);
+    });
+  });
+  await t.test('已有旧版服务可复用且不改写配置', async () => {
+    await externalService((req, res) => res.end(html), async ({ api, port, start }) => {
+      const result = await start();
+      assert.equal(result.alreadyRunning, true);
+      assert.equal(result.process, null);
+      assert.equal(result.browserUrl, api.APP_URL);
+      assert.equal(fs.existsSync(process.env.DSH_HOME), false);
+      await result.stop();
+      assert.equal(await api.isServerUp(port), true);
+    });
+  });
+  await t.test('已有新版服务拒绝无授权接管，接受有效 Cookie', async () => {
+    await externalService((req, res) => {
+      if (req.headers.cookie === 'dsh_session=existing') res.end(html);
+      else { res.statusCode = 401; res.end('dsh web authentication required'); }
+    }, async ({ api, port, start }) => {
+      await assert.rejects(start(), /没有有效登录状态/);
+      assert.equal(await api.isServerUp(port), true);
+      const result = await start({ authCookies: ['dsh_session=existing; Path=/; HttpOnly'] });
+      assert.equal(result.alreadyRunning, true);
+      assert.equal(fs.existsSync(process.env.DSH_HOME), false);
+      await result.stop();
+      assert.equal(await api.isServerUp(port), true);
+    });
+  });
+  await t.test('无关 HTTP 服务不会被关闭或当成 dsh 使用', async () => {
+    await externalService((req, res) => res.end('其他应用'), async ({ api, port, start }) => {
+      await assert.rejects(start(), /被其他服务占用/);
+      assert.equal(await api.isServerUp(port), true);
+      assert.equal(fs.existsSync(process.env.DSH_HOME), false);
+    });
+  });
+  await t.test('认证失败会清理本次启动的进程', async () => {
+    await withFixture('bad-auth', async ({ root, start }) => {
+      await assert.rejects(start(), /浏览器授权失败/);
+      await assertStopped(state(root, 'starts.json')[0].pid);
+    });
+  });
+  await t.test('新版未输出令牌时明确报错并清理进程', async () => {
+    await withFixture('missing-token', async ({ root, start }) => {
+      await assert.rejects(start({ authTimeoutMs: 200 }), /未获取到启动令牌/);
+      await assertStopped(state(root, 'starts.json')[0].pid);
+    });
+  });
+  await t.test('进程提前退出立即报错而非等待启动超时', async () => {
+    await withFixture('exit', async ({ start }) => {
+      const started = Date.now();
+      await assert.rejects(start({ startupTimeoutMs: 15000 }), /进程已退出（17）/);
+      assert.ok(Date.now() - started < 3000);
+    });
+  });
+  await t.test('启动超时会清理自己的进程及子进程', async () => {
+    await withFixture('hang', async ({ root, start }) => {
+      await assert.rejects(start({ startupTimeoutMs: 600 }), /启动超时/);
+      await assertStopped(state(root, 'starts.json')[0].pid);
+      await assertStopped(state(root, 'worker.json'));
+    });
+  });
+  await t.test('父进程先退出时仍清理拒绝退出的子进程', async () => {
+    await withFixture('stubborn', async ({ root, start }) => {
+      await assert.rejects(start({ startupTimeoutMs: 600 }), /启动超时/);
+      await assertStopped(state(root, 'starts.json')[0].pid);
+      await assertStopped(state(root, 'worker.json'));
+    });
+  });
+  await t.test('桌面空 PATH 下 shell 包装命令仍使用私有 Node', async () => {
+    await withFixture('shell', async ({ api, root, start }) => {
+      await start();
+      const started = state(root, 'starts.json')[0];
+      assert.equal(started.execPath, fs.realpathSync(process.execPath));
+      assert.ok(started.path.startsWith(path.join(api.runtimeDir(), 'node', 'bin')));
+      assert.ok(started.path.split(path.delimiter).includes('/usr/bin'));
+      assert.equal(started.port, api.PORT);
+    });
+  });
 });

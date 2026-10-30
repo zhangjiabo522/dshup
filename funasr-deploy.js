@@ -14,13 +14,17 @@ const os = require('os');
 const http = require('http');
 const { spawn } = require('child_process');
 
-const BASE = () => {
-  const base =
-    process.platform === 'win32'
-      ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
-      : path.join(os.homedir(), 'Library', 'Application Support');
-  return path.join(base, 'DeepSeekHarnessClient', 'funasr');
-};
+function clientBaseDir() {
+  if (process.platform === 'win32') {
+    return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient');
+  }
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeekHarnessClient');
+  }
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+  return path.join(dataHome, 'DeepSeekHarnessClient');
+}
+const BASE = () => path.join(clientBaseDir(), 'funasr');
 const VENV_PY = () =>
   process.platform === 'win32'
     ? path.join(BASE(), 'venv', 'Scripts', 'python.exe')
@@ -262,8 +266,15 @@ async function findPython() {
       );
     }
   } else {
-    // macOS：常见 python3 位置
-    candidates.push('/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3');
+    // macOS / Linux：常见 python3 位置
+    candidates.push(
+      '/opt/homebrew/bin/python3',
+      '/usr/local/bin/python3',
+      '/usr/bin/python3.11',
+      '/usr/bin/python3.10',
+      '/usr/bin/python3.9',
+      '/usr/bin/python3',
+    );
   }
   for (const c of candidates) {
     if (fs.existsSync(c) && pythonOk(await versionOfAsync(c))) return c;
@@ -352,7 +363,7 @@ async function deploy(opts = {}) {
       throw new Error(
         process.platform === 'win32'
           ? '未检测到 Python 3.8-3.11，且自动安装不可用。请手动安装 Python 3.11（https://www.python.org/downloads/release/python-3119/ ，安装时勾选 "Add Python to PATH"），完成后重试一键部署。'
-          : '未检测到 Python 3.8-3.11。请在 macOS 上安装（brew install python@3.11），完成后重试一键部署。'
+          : '未检测到 Python 3.8-3.11。请安装 Python 3.11 后重试（macOS: brew install python@3.11；Linux: sudo apt install python3.11 python3.11-venv）。'
       );
     }
   }

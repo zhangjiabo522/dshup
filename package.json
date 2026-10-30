@@ -1,7 +1,7 @@
 {
   "name": "dshup",
-  "version": "1.0.2",
-  "description": "dshup — DeepSeek Harness Windows 桌面客户端：自动检测/安装依赖（国内镜像）、内嵌显示、开机自启、语音输入（MiMo ASR / FunASR 一键部署）、用量统计",
+  "version": "1.0.3",
+  "description": "dshup — DeepSeek Harness 桌面客户端：自动检测/安装依赖（国内镜像）、内嵌显示、开机自启、语音输入（MiMo ASR / FunASR 一键部署）、用量统计",
   "main": "main.js",
   "license": "MIT",
   "repository": {
@@ -10,14 +10,19 @@
   },
   "scripts": {
     "start": "electron .",
-    "package:win": "electron-packager . DeepSeekHarnessClient --platform=win32 --arch=x64 --out=dist --overwrite --icon=assets/icon.ico --app-version=1.0.0 --ignore=\"^(/dist($|/)|/test-bootstrap\\.js$|/test-install\\.js$|/README\\.md$|/启动客户端\\.bat$)\"",
+    "package:win": "electron-packager . DeepSeekHarnessClient --platform=win32 --arch=x64 --out=dist --overwrite --icon=assets/icon.ico --ignore=\"^(/dist($|/)|/test-bootstrap\\.js$|/test-install\\.js$|/README\\.md$|/启动客户端\\.bat$)\"",
     "dist:installer": "electron-builder --win nsis",
-    "test:bootstrap": "node test-bootstrap.js"
+    "test:bootstrap": "node test-bootstrap.js",
+    "test:detect": "node test-detect.js",
+    "dist:linux": "electron-builder --linux deb --publish never",
+    "dist:deb": "electron-builder --linux deb --publish never",
+    "test:desktop": "node --test test-desktop-platform.js test-plugin-command.js test-voice-composer.js",
+    "test:smoke:linux": "node scripts/smoke-linux.js"
   },
   "build": {
     "appId": "com.deepseekai.dsh-client",
     "productName": "DeepSeek Harness",
-    "artifactName": "dshup-Setup-${version}.${ext}",
+    "artifactName": "${name}-${version}-${os}-${arch}.${ext}",
     "directories": {
       "output": "release"
     },
@@ -25,10 +30,12 @@
       "main.js",
       "preload.js",
       "bootstrap.js",
+      "desktop-platform.js",
       "stats-script.js",
       "funasr-deploy.js",
       "renderer/**/*",
       "assets/**/*",
+      "plugin/**/*",
       "package.json"
     ],
     "electronLanguages": [
@@ -44,7 +51,8 @@
           ]
         }
       ],
-      "icon": "assets/icon.ico"
+      "icon": "assets/icon.ico",
+      "artifactName": "dshup-Setup-${version}.${ext}"
     },
     "mac": {
       "target": [
@@ -57,7 +65,35 @@
         }
       ],
       "icon": "assets/icon.png",
-      "category": "public.app-category.developer-tools"
+      "category": "public.app-category.developer-tools",
+      "artifactName": "dshup-${version}-mac-${arch}.${ext}"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.png",
+      "category": "Development",
+      "desktop": {
+        "entry": {
+          "Name": "DeepSeek Harness",
+          "Comment": "DeepSeek Harness 桌面客户端",
+          "Categories": "Development;",
+          "StartupWMClass": "dshup",
+          "Terminal": "false",
+          "Type": "Application",
+          "Icon": "dshup"
+        }
+      },
+      "executableName": "dshup",
+      "synopsis": "DeepSeek Harness 桌面客户端",
+      "description": "自动检测/安装 DeepSeek Harness，并在桌面窗口内嵌显示 dsh web。",
+      "syncDesktopName": true
     },
     "nsis": {
       "oneClick": false,
@@ -68,11 +104,17 @@
       "shortcutName": "DeepSeek Harness",
       "deleteAppDataOnUninstall": false,
       "runAfterFinish": false
+    },
+    "deb": {
+      "packageName": "dshup",
+      "priority": "optional"
     }
   },
   "devDependencies": {
     "electron": "^33.2.0",
     "electron-builder": "^26.15.3",
     "electron-packager": "^17.1.2"
-  }
+  },
+  "author": "zhangjiabo <zhangjiabo522@users.noreply.github.com>",
+  "desktopName": "dshup.desktop"
 }

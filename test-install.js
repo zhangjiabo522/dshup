@@ -24,20 +24,20 @@ function log(msg) {
 
   log('步骤1: 安装 Node.js（国内镜像）…');
   const nodeExe = await installNode(emit);
-  log(`node.exe = ${nodeExe}`);
+  log(`node = ${nodeExe}`);
   const ver = require('child_process').spawnSync(nodeExe, ['--version'], { encoding: 'utf8' }).stdout.trim();
   log(`node 版本 = ${ver}`);
 
   log('步骤2: 安装 pnpm（国内镜像，私有目录）…');
   const pnpm = await installPnpm(nodeExe, emit);
-  log(`pnpm.cmd = ${pnpm}`);
-  const pv = require('child_process').spawnSync('cmd.exe', ['/d', '/c', `"${pnpm}" --version`], { encoding: 'utf8' }).stdout.trim();
+  log(`pnpm = ${pnpm}`);
+  const pv = require('child_process').spawnSync(pnpm, ['--version'], { encoding: 'utf8', shell: process.platform === 'win32' }).stdout.trim();
   log(`pnpm 版本 = ${pv}`);
 
   log('步骤3: 安装 @deepseek-ai/dsh（国内镜像，私有目录）…');
   const dshBin = await installDsh(nodeExe, emit);
-  log(`dsh.cmd = ${dshBin}`);
-  const dv = require('child_process').spawnSync('cmd.exe', ['/d', '/c', `"${dshBin}" --version`], { encoding: 'utf8' }).stdout.trim();
+  log(`dsh = ${dshBin}`);
+  const dv = require('child_process').spawnSync(dshBin, ['--version'], { encoding: 'utf8', shell: process.platform === 'win32' }).stdout.trim();
   log(`dsh 版本 = ${dv}`);
 
   console.log('\n=== 安装链路验证通过 ===');

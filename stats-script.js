@@ -16,9 +16,16 @@ const { zstdDecompressSync } = require('node:zlib');
 
 const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const root = path.join(home, 'sessions');
-const clientBase = process.platform === 'win32'
-  ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient')
-  : path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeekHarnessClient');
+const clientBase = (() => {
+  if (process.platform === 'win32') {
+    return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient');
+  }
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeekHarnessClient');
+  }
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+  return path.join(dataHome, 'DeepSeekHarnessClient');
+})();
 const CACHE_FILE = path.join(clientBase, 'stats-cache.json');
 const SNAPSHOT_FILE = path.join(clientBase, 'stats-snapshot.json');
 const MAX_CACHE_FILES = 5000; // 缓存条目上限保护：超过即整体重建，防止膨胀

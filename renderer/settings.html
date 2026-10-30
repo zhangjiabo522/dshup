@@ -2,8 +2,8 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: file:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src http://127.0.0.1:3080 http://localhost:3080;" />
-  <title>设置 - DeepSeek Harness</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: file:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-src http://127.0.0.1:* http://localhost:*;" />
+  <title>客户端设置 - DeepSeek Harness</title>
   <style>
     :root {
       --bg: #0d1117;
@@ -14,6 +14,8 @@
       --muted: #8b949e;
       --accent: #4f8cff;
       --ok: #3fb950;
+      --warn: #d29922;
+      --danger: #f85149;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; }
@@ -21,13 +23,11 @@
       background: var(--bg);
       color: var(--fg);
       font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
-      padding-top: 36px; /* 自定义标题栏 */
+      padding-top: 36px;
       overflow: hidden;
       user-select: none;
     }
     .layout { display: flex; height: 100%; }
-
-    /* 左侧 tab 栏 */
     .side {
       width: 220px; flex: none;
       background: var(--panel);
@@ -54,35 +54,38 @@
     .tab.active { background: rgba(79,140,255,0.14); color: #9cc0ff; }
     .tab .ico { width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; }
     .side-foot { margin-top: auto; }
-    #backBtn {
-      width: 100%; background: transparent; border: 1px solid var(--line);
+    #backBtn, .btn {
+      background: transparent; border: 1px solid var(--line);
       color: var(--muted); border-radius: 8px; padding: 9px 12px;
       font-size: 13px; cursor: pointer; transition: all 0.15s ease;
     }
-    #backBtn:hover { color: var(--fg); border-color: var(--accent); }
-
-    /* 右侧内容区 */
+    #backBtn { width: 100%; }
+    #backBtn:hover, .btn:hover { color: var(--fg); border-color: var(--accent); }
+    .btn-primary {
+      background: var(--accent); color: #fff; border: none;
+      border-radius: 8px; padding: 9px 22px; font-size: 14px; cursor: pointer;
+    }
+    .btn-primary:hover { filter: brightness(1.12); }
+    .btn-danger { border-color: var(--danger); color: var(--danger); }
     .content { flex: 1; overflow: hidden; position: relative; }
     .panel { position: absolute; inset: 0; display: none; flex-direction: column; }
     .panel.active { display: flex; }
     .panel-head {
       padding: 18px 24px 12px; border-bottom: 1px solid var(--line);
-      display: flex; align-items: baseline; gap: 10px;
+      display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
     }
     .panel-head h2 { font-size: 17px; font-weight: 600; }
     .panel-head .hint { font-size: 12px; color: var(--muted); }
     .panel-body { padding: 20px 24px; overflow-y: auto; flex: 1; }
-
-    /* 开关行 */
     .row {
       display: flex; align-items: center; justify-content: space-between;
       background: var(--panel); border: 1px solid var(--line);
       border-radius: 10px; padding: 14px 16px; margin-bottom: 12px;
-      max-width: 640px;
+      max-width: 760px; gap: 16px;
     }
     .row .label { font-size: 14px; }
     .row .desc { font-size: 12px; color: var(--muted); margin-top: 3px; }
-    .switch { position: relative; width: 42px; height: 24px; flex: none; margin-left: 16px; }
+    .switch { position: relative; width: 42px; height: 24px; flex: none; }
     .switch input { opacity: 0; width: 0; height: 0; }
     .switch .slider {
       position: absolute; inset: 0; cursor: pointer;
@@ -96,63 +99,93 @@
     }
     .switch input:checked + .slider { background: var(--accent); }
     .switch input:checked + .slider::before { transform: translateX(18px); }
-
-    /* 个性化 */
-    .instr-path { font-size: 12px; color: var(--muted); margin-bottom: 10px; user-select: text; }
-    #instrTextarea {
-      width: 100%; height: 340px; resize: vertical;
+    select, input[type="text"], input[type="password"], input[type="search"] {
+      background: var(--panel2); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 8px;
+      padding: 7px 10px; font-size: 13px; min-width: 180px;
+    }
+    textarea {
+      width: 100%; resize: vertical;
       background: var(--panel); color: var(--fg);
       border: 1px solid var(--line); border-radius: 10px;
       padding: 12px; font: 13px/1.6 Consolas, "Microsoft YaHei UI", monospace;
       outline: none; user-select: text;
     }
-    #instrTextarea:focus { border-color: var(--accent); }
-    .save-row { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
-    #saveBtn {
-      background: var(--accent); color: #fff; border: none;
-      border-radius: 8px; padding: 9px 22px; font-size: 14px; cursor: pointer;
-      transition: filter 0.15s ease;
-    }
-    #saveBtn:hover { filter: brightness(1.12); }
-    #saveStatus { font-size: 13px; color: var(--ok); }
-
-    /* 网页设置 iframe */
+    textarea:focus, select:focus, input:focus { border-color: var(--accent); }
+    .instr-path, .mono { font-size: 12px; color: var(--muted); margin-bottom: 10px; user-select: text; }
+    .save-row { margin-top: 14px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    #saveStatus, .status { font-size: 13px; color: var(--ok); }
+    .status.warn { color: var(--warn); }
+    .status.err { color: var(--danger); }
     #tab-web.panel { padding: 0; }
     #webFrame { width: 100%; height: 100%; border: none; background: #fff; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; max-width: 900px; margin-bottom: 16px; }
+    .card {
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: 10px; padding: 14px 16px;
+    }
+    .card .k { font-size: 12px; color: var(--muted); }
+    .card .v { font-size: 20px; margin-top: 6px; font-weight: 600; }
+    .plugin {
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; max-width: 900px;
+    }
+    .plugin h3 { font-size: 14px; margin-bottom: 4px; }
+    .plugin p { font-size: 12px; color: var(--muted); margin-bottom: 8px; user-select: text; }
+    .plugin .meta { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+    .plugin .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }
+    .heat { display: flex; gap: 3px; margin-top: 8px; flex-wrap: wrap; }
+    .heat i { width: 10px; height: 10px; border-radius: 2px; background: #21262d; display: inline-block; }
+    .heat i.lv1 { background: #0e4429; }
+    .heat i.lv2 { background: #006d32; }
+    .heat i.lv3 { background: #26a641; }
+    .heat i.lv4 { background: #39d353; }
+    .cal { display: flex; gap: 6px; margin-top: 10px; }
+    .cal-col { display: flex; flex-direction: column; gap: 3px; }
+    .cal-col .today { outline: 1px solid #fff; }
+    .log {
+      background: #0b0f14; border: 1px solid var(--line); border-radius: 8px;
+      padding: 10px; font: 12px/1.5 Consolas, monospace; color: #9da7b3;
+      max-height: 180px; overflow: auto; user-select: text; white-space: pre-wrap;
+      margin-top: 10px;
+    }
+    .banner {
+      max-width: 760px; margin-bottom: 14px; padding: 10px 12px;
+      border: 1px solid var(--line); border-radius: 8px; background: var(--panel2);
+      font-size: 12px; color: var(--muted);
+    }
   </style>
 </head>
 <body>
   <div class="layout">
     <aside class="side">
-      <div class="side-title">设置</div>
+      <div class="side-title">客户端设置</div>
       <nav>
-        <button class="tab active" data-tab="system">
-          <span class="ico">⚙️</span>系统设置
-        </button>
-        <button class="tab" data-tab="personal">
-          <span class="ico">🎨</span>个性化
-        </button>
-        <button class="tab" data-tab="web">
-          <span class="ico">🌐</span>网页设置
-        </button>
+        <button class="tab active" data-tab="system"><span class="ico">⚙️</span>系统设置</button>
+        <button class="tab" data-tab="personal"><span class="ico">✨</span>个性化</button>
+        <button class="tab" data-tab="web"><span class="ico">🌐</span>网页设置</button>
+        <button class="tab" data-tab="data"><span class="ico">💾</span>数据与存储</button>
+        <button class="tab" data-tab="market"><span class="ico">🧩</span>插件市场</button>
+        <button class="tab" data-tab="stats"><span class="ico">📊</span>统计</button>
+        <button class="tab" data-tab="voice"><span class="ico">🎤</span>语音输入</button>
+        <button class="tab" data-tab="about"><span class="ico">ℹ️</span>关于</button>
       </nav>
       <div class="side-foot">
-        <button id="backBtn">← 返回主界面</button>
+        <button id="backBtn">← 返回客户端</button>
       </div>
     </aside>
-
     <main class="content">
-      <!-- 系统设置 -->
       <section class="panel active" id="tab-system">
         <div class="panel-head">
           <h2>系统设置</h2>
-          <span class="hint">客户端行为相关</span>
+          <span class="hint">这些是 dshup 客户端行为，不是官方 dsh 网页设置</span>
         </div>
         <div class="panel-body">
           <div class="row">
             <div>
               <div class="label">开机自动启动</div>
-              <div class="desc">登录 Windows 后自动在后台启动 DeepSeek Harness（打开客户端时无需等待）</div>
+              <div class="desc">登录系统后自动在后台启动 DeepSeek Harness（打开客户端时无需等待）</div>
             </div>
             <label class="switch"><input type="checkbox" id="autoStartToggle" /><span class="slider"></span></label>
           </div>
@@ -163,32 +196,270 @@
             </div>
             <label class="switch"><input type="checkbox" id="stopToggle" /><span class="slider"></span></label>
           </div>
+          <div class="row">
+            <div>
+              <div class="label">关闭窗口时最小化到托盘</div>
+              <div class="desc">点关闭按钮时隐藏到系统托盘，而不是退出客户端</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="trayToggle" /><span class="slider"></span></label>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">启动后最小化</div>
+              <div class="desc">打开客户端后自动最小化到任务栏</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="minToggle" /><span class="slider"></span></label>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">任务完成时发送系统通知</div>
+              <div class="desc">会话任务结束后弹出桌面通知</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="notifyToggle" /><span class="slider"></span></label>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">硬件加速</div>
+              <div class="desc">GPU 加速渲染。关闭可省内存，部分显卡可修复花屏。修改后需重启客户端</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="accelToggle" /><span class="slider"></span></label>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">启动时检查更新</div>
+              <div class="desc">静默查询 GitHub Releases，发现新版本只写日志不弹窗</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="updateToggle" /><span class="slider"></span></label>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">下载镜像</div>
+              <div class="desc">安装 Node / pnpm / dsh 时使用的 npm 与 Node 二进制源</div>
+            </div>
+            <select id="mirrorSelect">
+              <option value="npmmirror">国内镜像（npmmirror）</option>
+              <option value="official">官方源</option>
+            </select>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">网络模式</div>
+              <div class="desc">依赖下载是否走系统代理。本地 3080 检测始终直连</div>
+            </div>
+            <select id="proxySelect">
+              <option value="auto">自动检测系统代理</option>
+              <option value="direct">直连，不走代理</option>
+            </select>
+          </div>
         </div>
       </section>
 
-      <!-- 个性化 -->
       <section class="panel" id="tab-personal">
         <div class="panel-head">
           <h2>个性化</h2>
-          <span class="hint">自定义提示词，每次对话自动附加在系统提示词后面</span>
+          <span class="hint">保存到 $DSH_HOME/AGENTS.md，每次对话自动附加在系统提示词后面</span>
         </div>
         <div class="panel-body">
           <div class="instr-path" id="instrPath"></div>
-          <textarea id="instrTextarea" spellcheck="false" placeholder="在这里写下你的个性化提示词，例如：&#10;&#10;- 始终使用中文回答&#10;- 代码注释用中文&#10;- 回答尽量简洁&#10;&#10;保存后，每次对话都会把上面的内容附加到系统提示词后面。"></textarea>
+          <div class="row">
+            <div>
+              <div class="label">回答语言</div>
+              <div class="desc">写入个性化偏好，模型会尽量遵循</div>
+            </div>
+            <select id="langSelect">
+              <option value="">默认</option>
+              <option value="中文">中文</option>
+              <option value="English">English</option>
+            </select>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">回答风格</div>
+              <div class="desc">简洁或详细，按你的阅读习惯</div>
+            </div>
+            <select id="styleSelect">
+              <option value="">默认</option>
+              <option value="简洁">简洁</option>
+              <option value="详细">详细</option>
+            </select>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">记忆功能</div>
+              <div class="desc">打开后，客户端会指示模型把重要偏好写入记忆块</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="memoryToggle" /><span class="slider"></span></label>
+          </div>
+          <div class="label" style="margin: 8px 0;">记忆内容</div>
+          <textarea id="memoryText" rows="6" placeholder="每条一行，例如：&#10;- 喜欢 TypeScript&#10;- 回答尽量给可运行示例"></textarea>
           <div class="save-row">
-            <button id="saveBtn">保存提示词</button>
+            <button class="btn" id="clearMemoryBtn">清空记忆</button>
+          </div>
+          <div class="label" style="margin: 16px 0 8px;">自定义提示词</div>
+          <textarea id="instrTextarea" rows="10" placeholder="在这里写下你的个性化提示词，例如：&#10;&#10;- 始终使用中文回答&#10;- 代码注释用中文&#10;- 回答尽量简洁"></textarea>
+          <div class="save-row">
+            <button class="btn-primary" id="saveBtn">保存全部个性化设置</button>
             <span id="saveStatus"></span>
           </div>
         </div>
       </section>
 
-      <!-- 网页设置（移植原 dsh 设置面板） -->
       <section class="panel" id="tab-web">
-        <iframe id="webFrame" src="http://127.0.0.1:3080/"></iframe>
+        <iframe id="webFrame" src="about:blank" title="官方 dsh 网页设置"></iframe>
+      </section>
+
+      <section class="panel" id="tab-data">
+        <div class="panel-head">
+          <h2>数据与存储</h2>
+          <span class="hint">客户端私有目录，卸载应用不会自动删除</span>
+        </div>
+        <div class="panel-body" id="dataBody">
+          <div class="banner">正在读取目录信息…</div>
+        </div>
+      </section>
+
+      <section class="panel" id="tab-market">
+        <div class="panel-head">
+          <h2>插件市场</h2>
+          <span class="hint">GitHub topic:dsh-plugin · 一键安装到官方 dsh web profile</span>
+        </div>
+        <div class="panel-body">
+          <div class="toolbar">
+            <input type="search" id="marketQuery" placeholder="搜索插件" />
+            <button class="btn" id="marketSearchBtn">搜索</button>
+            <button class="btn" id="speedtestBtn">测速</button>
+            <button class="btn" id="mineBtn">我的插件</button>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">下载镜像</div>
+              <div class="desc">安装插件时走 GitHub 直连或加速前缀</div>
+            </div>
+            <select id="marketMirror">
+              <option value="direct">直连（github.com）</option>
+              <option value="ghfast">ghfast.top</option>
+              <option value="ghproxy">gh-proxy.com</option>
+              <option value="ghproxy-net">mirror.ghproxy.com</option>
+              <option value="ghdl">gh.ddlc.top</option>
+              <option value="ghp">ghp.ci</option>
+            </select>
+          </div>
+          <div id="speedResult" class="mono"></div>
+          <div id="mineBox"></div>
+          <div id="pluginList">插件列表加载中…</div>
+          <div class="toolbar">
+            <button class="btn" id="prevPage">上一页</button>
+            <span class="mono" id="pageInfo"></span>
+            <button class="btn" id="nextPage">下一页</button>
+          </div>
+          <div class="log" id="marketLog"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="tab-stats">
+        <div class="panel-head">
+          <h2>统计</h2>
+          <span class="hint">扫描本地会话，快照秒开，后台增量刷新</span>
+        </div>
+        <div class="panel-body" id="statsBody">
+          <div class="banner">正在读取统计…</div>
+        </div>
+      </section>
+
+      <section class="panel" id="tab-voice">
+        <div class="panel-head">
+          <h2>语音输入</h2>
+          <span class="hint">dshup 客户端语音识别：远程 MiMo ASR 或本地 FunASR</span>
+        </div>
+        <div class="panel-body">
+          <div class="row">
+            <div>
+              <div class="label">识别模式</div>
+              <div class="desc">远程走小米 MiMo ASR；本地可一键部署 FunASR</div>
+            </div>
+            <select id="asrMode">
+              <option value="remote">远程 MiMo ASR</option>
+              <option value="local">本地 FunASR</option>
+            </select>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">语言</div>
+              <div class="desc">auto / zh / en</div>
+            </div>
+            <select id="asrLang">
+              <option value="auto">auto</option>
+              <option value="zh">zh</option>
+              <option value="en">en</option>
+            </select>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">远程接口</div>
+              <div class="desc">MiMo ASR Base URL</div>
+            </div>
+            <input type="text" id="asrBase" />
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">模型</div>
+            </div>
+            <input type="text" id="asrModel" />
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">API Key</div>
+            </div>
+            <input type="password" id="asrKey" />
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">本地服务地址</div>
+            </div>
+            <input type="text" id="asrLocal" />
+          </div>
+          <div class="save-row">
+            <button class="btn-primary" id="asrSave">保存语音配置</button>
+            <span id="asrSaveStatus" class="status"></span>
+          </div>
+          <div class="banner" id="asrLocalStatus" style="margin-top:16px;">本地 FunASR 状态读取中…</div>
+          <div class="save-row">
+            <button class="btn" id="asrDeploy">一键部署本地 FunASR</button>
+            <button class="btn" id="asrStart">启动</button>
+            <button class="btn" id="asrStop">停止</button>
+          </div>
+          <div class="log" id="asrLog"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="tab-about">
+        <div class="panel-head">
+          <h2>关于</h2>
+          <span class="hint">dshup 桌面客户端</span>
+        </div>
+        <div class="panel-body">
+          <div class="row">
+            <div>
+              <div class="label">DeepSeek Harness 桌面客户端</div>
+              <div class="desc" id="aboutVer">读取版本中…</div>
+            </div>
+            <button class="btn" id="checkUpdateBtn">检查更新</button>
+          </div>
+          <div class="row">
+            <div>
+              <div class="label">项目仓库</div>
+              <div class="desc">https://github.com/zhangjiabo522/dshup</div>
+            </div>
+            <button class="btn" id="openRepoBtn">打开仓库</button>
+          </div>
+          <div class="banner">
+            客户端设置保存在本机 `client-settings.json`。网页里的模型 / 插件 / Agent 预设属于官方 dsh，请用左侧「网页设置」。
+          </div>
+          <div id="updateStatus" class="mono"></div>
+        </div>
       </section>
     </main>
   </div>
-
   <script src="settings.js"></script>
 </body>
 </html>

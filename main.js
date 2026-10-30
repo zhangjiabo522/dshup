@@ -5,26 +5,34 @@ const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { bootstrap } = require('./bootstrap');
+const { bootstrap, clientBaseDir, APP_URL } = require('./bootstrap');
+const {
+  RELEASES_URL,
+  isTrustedPageUrl,
+  linuxAutostartPath,
+  createLinuxAutostart,
+  linuxAutostartEnabled,
+  releaseUpdateInfo,
+} = require('./desktop-platform');
 
 // 显式指定 userData（Chromium 缓存 / GPU 缓存 / localStorage 落点）：
 // 安装版默认会按 productName 建目录（含空格），存在首次创建失败风险；
 // 统一放到无空格的私有目录，确保始终可写。
 app.setPath(
   'userData',
-  path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient', 'user-data')
+  path.join(clientBaseDir(), 'user-data')
 );
 
 // 冒烟测试用独立 userData：与正在运行的客户端共享 Chromium 配置目录会互相抢锁，
 // 导致渲染进程起不来（表现为页面永不加载、窗口随 window-all-closed 静默退出）。
 if (process.argv.includes('--smoke-test')) {
-  app.setPath('userData', path.join(os.tmpdir(), `dsh-smoke-user-data-${process.pid}`));
+  app.setPath('userData', path.join(process.env.XDG_CONFIG_HOME || os.tmpdir(), `dsh-smoke-user-data-${process.pid}`));
 }
 
 // 硬件加速开关：必须在 app ready 之前读取设置并调用（关闭 GPU 可显著省内存，部分老旧显卡可修复花屏）
 try {
   if (JSON.parse(fs.readFileSync(
-    path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient', 'client-settings.json'),
+    path.join(clientBaseDir(), 'client-settings.json'),
     'utf8',
   )).hardwareAcceleration === false) {
     app.disableHardwareAcceleration();
@@ -37,13 +45,34 @@ try {
 const SPLASH = path.join(__dirname, 'renderer', 'index.html');
 const SETTINGS_PAGE = path.join(__dirname, 'renderer', 'settings.html');
 
-// 客户端本地设置文件（分平台：Windows LOCALAPPDATA / macOS Application Support）
+// 客户端本地设置文件（Windows LOCALAPPDATA / macOS Application Support / Linux XDG）
 function clientSettingsFile() {
-  const base =
-    process.platform === 'win32'
-      ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
-      : path.join(os.homedir(), 'Library', 'Application Support');
-  return path.join(base, 'DeepSeekHarnessClient', 'client-settings.json');
+  return path.join(clientBaseDir(), 'client-settings.json');
+}
+
+function linuxAutostartFile() {
+  return linuxAutostartPath();
+}
+
+function setAutoStartLinux(enable) {
+  const file = linuxAutostartFile();
+  if (!enable) {
+    try {
+      fs.unlinkSync(file);
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+    autoStartRegCache = { at: Date.now(), value: false };
+    return;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const desktop = createLinuxAutostart({
+    executable: process.execPath,
+    appPath: app.isPackaged ? null : app.getAppPath(),
+    icon: path.join(__dirname, 'assets', 'icon.png'),
+  });
+  fs.writeFileSync(file, desktop, 'utf8');
+  autoStartRegCache = { at: Date.now(), value: true };
 }
 
 // 注册表探测结果缓存 30 秒：readClientSettings 每次点击都会调用，reg 查询是
@@ -58,6 +87,18 @@ function autoStartRegExists() {
       const out = execFileSync('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'DeepSeek Harness'], { encoding: 'utf8', windowsHide: true, timeout: 8000 });
       found = /DeepSeek Harness/.test(out);
     } catch (e) {
+      found = false;
+    }
+  } else if (process.platform === 'linux') {
+    try {
+      found = linuxAutostartEnabled(fs.readFileSync(linuxAutostartFile(), 'utf8'));
+    } catch {
+      found = false;
+    }
+  } else if (process.platform === 'darwin') {
+    try {
+      found = app.getLoginItemSettings().openAtLogin;
+    } catch {
       found = false;
     }
   }
@@ -80,7 +121,9 @@ function readClientSettings() {
   };
   try {
     const raw = fs.readFileSync(clientSettingsFile(), 'utf8');
-    return { ...defaults, ...JSON.parse(raw) };
+    const settings = { ...defaults, ...JSON.parse(raw) };
+    if (process.platform === 'linux') settings.autoStart = defaults.autoStart;
+    return settings;
   } catch (e) {
     return defaults;
   }
@@ -278,7 +321,7 @@ let tray = null; // 系统托盘图标（常驻：关闭到托盘后从托盘恢
 function autoLog(line) {
   if (!AUTO_START) return;
   try {
-    const dir = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient');
+    const dir = clientBaseDir();
     fs.mkdirSync(dir, { recursive: true });
     fs.appendFileSync(path.join(dir, 'autostart.log'), `[${new Date().toLocaleString()}] ${line}\n`);
   } catch (e) {
@@ -319,6 +362,8 @@ function ensureAutoStart() {
         if (!settings.openAtLogin) {
           app.setLoginItemSettings({ openAtLogin: true, openAsHidden: false, args: ['--autostart'] });
         }
+      } else if (process.platform === 'linux') {
+        setAutoStartLinux(true);
       } else {
         setAutoStartReg(true);
       }
@@ -341,7 +386,7 @@ function createWindow() {
     minWidth: 960,
     minHeight: 640,
     title: 'DeepSeek Harness',
-    icon: path.join(__dirname, 'assets', 'icon.ico'),
+    icon: path.join(__dirname, 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png'),
     backgroundColor: '#0d1117',
     frame: false, // 无边框：使用自定义平滑标题栏
     webPreferences: {
@@ -352,6 +397,16 @@ function createWindow() {
     },
   });
   win.loadFile(SPLASH);
+
+  // Ctrl+, 打开 dshup 客户端设置页（不是官方 dsh 网页设置）
+  win.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return;
+    const comma = input.key === ',' || input.code === 'Comma';
+    if (comma && (input.control || input.meta) && !input.alt && !input.shift) {
+      event.preventDefault();
+      if (win && !win.isDestroyed()) win.loadFile(SETTINGS_PAGE);
+    }
+  });
 
   // 页面缩放保持用户可控：Ctrl+滚轮 / Ctrl+加号减号 等比缩放（长页面可缩小后完整显示），Ctrl+0 复位
   // 不做任何锁定；每次加载新页面时复位到 100%，避免残留缩放
@@ -685,11 +740,20 @@ function createWindow() {
     win.webContents.on('did-finish-load', () => {
       const url = win.webContents.getURL();
       if (url.startsWith('http://127.0.0.1:') || url.startsWith('http://localhost:')) {
-        const finish = () => {
+        const finish = async () => {
           console.log('[smoke] OK url=' + url + ' title=' + JSON.stringify(win.webContents.getTitle()));
+          if (bootResult && !bootResult.alreadyRunning) await bootResult.stop();
           setTimeout(() => app.exit(0), 600);
         };
         const verify = async () => {
+          if (process.env.DSHUP_SMOKE_MARKER) {
+            const marker = await win.webContents.executeJavaScript("document.querySelector('[data-dshup-smoke]')?.textContent || ''").catch(() => '');
+            if (marker !== process.env.DSHUP_SMOKE_MARKER) {
+              console.error('[smoke] 认证后的测试页面未加载');
+              app.exit(1);
+              return;
+            }
+          }
           try {
             // 查找 dsh 设置触发按钮（供设置页 iframe 自动打开设置面板使用）
             const settingsBtn = await win.webContents.executeJavaScript(`(() => {
@@ -848,7 +912,7 @@ function createWindow() {
             console.log('[titlebar] ' + JSON.stringify(diag));
             try {
               fs.writeFileSync(
-                path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient', 'diag-titlebar.json'),
+                path.join(clientBaseDir(), 'diag-titlebar.json'),
                 JSON.stringify(diag, null, 2)
               );
             } catch (e) { /* ignore */ }
@@ -881,16 +945,13 @@ function createWindow() {
     if (url.startsWith('http://') || url.startsWith('https://')) shell.openExternal(url);
     return { action: 'deny' };
   });
-  win.webContents.on('will-navigate', (e, url) => {
-    const target = bootResult ? bootResult.url : null;
-    if (target && url === target) return; // 允许加载 dsh 页面
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-      if (!url.startsWith('http://127.0.0.1:') && !url.startsWith('http://localhost:')) {
-        e.preventDefault();
-        shell.openExternal(url);
-      }
-    }
-  });
+  const guardNavigation = (event, url) => {
+    if (isTrustedPageUrl(url, APP_URL)) return;
+    event.preventDefault();
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url).catch(() => {});
+  };
+  win.webContents.on('will-navigate', guardNavigation);
+  win.webContents.on('will-redirect', guardNavigation);
 
   // dsh 服务意外挂掉时，切回启动页并提示重试
   win.webContents.on('did-fail-load', (_e, code, desc, url) => {
@@ -910,14 +971,14 @@ function createWindow() {
       const frame = e && e.frame;
       if (isMainFrame) {
         // 语音引导：主窗口回到 dsh 页面后自动打开设置面板并切到"语音输入"
-        if (frame && /^https?:\/\/(127\.0\.0\.1|localhost):3080(\/|$)/.test(frame.url) && pendingVoiceSection) {
+        if (frame && new URL(frame.url).origin === new URL(APP_URL).origin && pendingVoiceSection) {
           setTimeout(() => {
             autoOpenSettingsPanel(frame).then((r) => console.log('[autoopen] main result: ' + r));
           }, 1800);
         }
         return;
       }
-      if (frame && /^https?:\/\/(127\.0\.0\.1|localhost):3080(\/|$)/.test(frame.url)) {
+      if (frame && new URL(frame.url).origin === new URL(APP_URL).origin) {
         setTimeout(() => {
           autoOpenSettingsPanel(frame).then((r) => console.log('[autoopen] result: ' + r));
         }, 2500);
@@ -934,10 +995,12 @@ async function runBootstrap() {
   try {
     // 若上次由本客户端启动的服务还活着，先停掉，避免重复实例
     if (bootResult && bootResult.stop && !bootResult.alreadyRunning) {
-      try { bootResult.stop(); } catch (e) { /* ignore */ }
+      await bootResult.stop();
     }
     send('phase', { message: 'checking' });
+    const authCookies = await require('electron').session.defaultSession.cookies.get({ url: APP_URL });
     bootResult = await bootstrap({
+      authCookies: authCookies.map(({ name, value }) => `${name}=${value}`),
       onEvent: (ev) => {
         send(ev.type, ev);
         if (AUTO_START && (ev.type === 'status' || ev.type === 'log' || ev.type === 'error' || ev.type === 'server')) {
@@ -945,6 +1008,8 @@ async function runBootstrap() {
         }
       },
     });
+    // dsh >= 0.2：写入认证 cookie，保证内嵌窗口与 iframe/api 请求都通过认证
+    if (!bootResult.alreadyRunning) await installAuthCookies(bootResult.cookies);
     // 等待页面首次渲染稳定后再切到内嵌页面
     setTimeout(() => {
       if (win && !win.isDestroyed()) {
@@ -966,20 +1031,65 @@ async function runBootstrap() {
 // 加载 dsh 页面 + 渲染健康检查：开机自启刚拉起服务时页面可能尚未渲染（黑屏），
 // 自动重新加载直到渲染出界面（最多 retries 次）。
 let renderRetryTimer = null;
+
+/**
+ * dsh >= 0.2 的浏览器认证 cookie：bootstrap 已用 launch token 换到 Set-Cookie，
+ * 这里写进 Electron 的 session，内嵌窗口后续所有请求（含 iframe、/api）都自动带上。
+ * 只对 127.0.0.1/localhost 生效，不污染其它站点。
+ */
+async function installAuthCookies(cookies) {
+  if (!Array.isArray(cookies) || cookies.length === 0) return;
+  const { session } = require('electron');
+  for (const raw of cookies) {
+    const line = String(raw);
+    const [pair] = line.split(';');
+    const eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    const name = pair.slice(0, eq).trim();
+    const value = pair.slice(eq + 1).trim();
+    if (!name) continue;
+    const maxAgeMatch = /max-age=(\d+)/i.exec(line);
+    const expiresMatch = /expires=([^;]+)/i.exec(line);
+    const cookie = {
+      url: APP_URL,
+      name,
+      value,
+      path: /(?:^|;)\s*path=([^;]+)/i.exec(line)?.[1] || '/',
+      httpOnly: /httponly/i.test(line),
+      sameSite: /samesite=strict/i.test(line) ? 'strict' : /samesite=lax/i.test(line) ? 'lax' : 'unspecified',
+    };
+    if (maxAgeMatch) cookie.expirationDate = Math.floor(Date.now() / 1000) + Number(maxAgeMatch[1]);
+    else if (expiresMatch) {
+      const at = Date.parse(expiresMatch[1]);
+      if (!Number.isNaN(at)) cookie.expirationDate = Math.floor(at / 1000);
+    }
+    try {
+      await session.defaultSession.cookies.set(cookie);
+    } catch (e) {
+      throw new Error('无法保存本地服务的登录状态，请重试启动客户端。');
+    }
+  }
+}
+
 function loadDshPage(retriesLeft) {
   if (!win || win.isDestroyed()) return;
-  const url = bootResult ? bootResult.url : 'http://127.0.0.1:3080/';
-  win.loadURL(url).catch(() => { /* ignore */ });
+  const url = bootResult ? bootResult.url : APP_URL;
+  // 0.2.x 首次进入必须用带 token 的地址（消费一次即种下 cookie 并跳回干净地址）
+  const firstUrl = bootResult && !bootResult.cookies?.length && bootResult.launchUrl ? bootResult.launchUrl : url;
+  if (bootResult && bootResult.launchUrl) bootResult.launchUrl = null; // token 只能消费一次
+  win.loadURL(firstUrl).catch(() => { /* ignore */ });
   clearTimeout(renderRetryTimer);
   renderRetryTimer = setTimeout(async () => {
     if (!win || win.isDestroyed()) return;
-    if (win.webContents.getURL() !== url) return; // 用户已导航走
+    const current = win.webContents.getURL();
+    // 完成认证后地址会变成不带 token 的干净地址，两者都视为"仍在我们自己的页面"
+    if (current !== url && current !== firstUrl && !current.startsWith('http://127.0.0.1:')) return;
     const rendered = await win.webContents
       .executeJavaScript(
         `(() => {
           const buttons = document.querySelectorAll('button').length;
           const textLen = document.body ? (document.body.textContent || '').trim().length : 0;
-          return buttons > 3 || textLen > 20;
+          return buttons > 3 && textLen > 20 && !document.body.textContent.trim().startsWith('dsh web authentication required');
         })()`
       )
       .catch(() => false);
@@ -1031,7 +1141,7 @@ ipcMain.handle('open-settings', () => {
 });
 ipcMain.handle('close-settings', () => {
   if (win && !win.isDestroyed()) {
-    const url = bootResult ? bootResult.url : 'http://127.0.0.1:3080/';
+    const url = bootResult ? bootResult.url : APP_URL;
     win.loadURL(url);
   }
 });
@@ -1056,6 +1166,8 @@ ipcMain.handle('settings:set', (_e, key, value) => {
   if (key === 'autoStart') {
     if (process.platform === 'darwin') {
       app.setLoginItemSettings({ openAtLogin: !!value, openAsHidden: false, args: ['--autostart'] });
+    } else if (process.platform === 'linux') {
+      setAutoStartLinux(!!value);
     } else {
       setAutoStartReg(!!value);
     }
@@ -1114,11 +1226,18 @@ function showWindow() {
 function createTray() {
   try {
     const { Tray, Menu, nativeImage } = require('electron');
-    const raw = nativeImage.createFromPath(path.join(__dirname, 'assets', 'icon.ico'));
+    const raw = nativeImage.createFromPath(path.join(__dirname, 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png'));
     tray = new Tray(raw.resize({ width: 16, height: 16 }));
     tray.setToolTip('DeepSeek Harness');
     tray.setContextMenu(Menu.buildFromTemplate([
       { label: '显示 DeepSeek Harness', click: () => { showWindow(); } },
+      {
+        label: '客户端设置',
+        click: () => {
+          showWindow();
+          if (win && !win.isDestroyed()) win.loadFile(SETTINGS_PAGE);
+        },
+      },
       { type: 'separator' },
       {
         label: '退出',
@@ -1136,22 +1255,12 @@ function createTray() {
 
 // ---------------- 更新检查（GitHub Releases） ----------------
 
-/** 简化版语义化版本比较：a > b 返回正数。 */
-function compareVersions(a, b) {
-  const pa = String(a).replace(/^v/, '').split('.').map(x => parseInt(x, 10) || 0);
-  const pb = String(b).replace(/^v/, '').split('.').map(x => parseInt(x, 10) || 0);
-  for (let i = 0; i < 3; i += 1) {
-    if (pa[i] !== pb[i]) return pa[i] - pb[i];
-  }
-  return 0;
-}
-
 /** 查 GitHub 最新 release（直连，超时容错；走代理时失败会返回 error 字段）。结果缓存 10 分钟。 */
 let updateCache = { at: 0, data: null };
 async function checkUpdate() {
   if (updateCache.data !== null && Date.now() - updateCache.at < 600000) return updateCache.data;
   const current = app.getVersion();
-  const base = { current, latest: '', url: 'https://github.com/zhangjiabo522/dshup/releases/latest', hasUpdate: false };
+  const base = { current, latest: '', url: RELEASES_URL, hasUpdate: false };
   try {
     const { net } = require('electron');
     const request = net.request({
@@ -1160,17 +1269,38 @@ async function checkUpdate() {
     });
     const body = await new Promise((resolve, reject) => {
       const chunks = [];
+      let settled = false;
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error);
+        else resolve(value);
+      };
+      const timer = setTimeout(() => {
+        finish(new Error('检查更新超时'));
+        request.abort();
+      }, 10000);
       request.on('response', (res) => {
+        if (res.statusCode !== 200) {
+          finish(new Error(`检查更新失败（HTTP ${res.statusCode}）`));
+          request.abort();
+          return;
+        }
         res.on('data', chunk => chunks.push(chunk));
-        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        res.on('error', error => finish(error));
+        res.on('end', () => finish(null, Buffer.concat(chunks).toString('utf8')));
       });
-      request.on('error', reject);
-      request.end();
+      request.on('error', error => finish(error));
+      try {
+        request.end();
+      } catch (error) {
+        finish(error);
+      }
     });
     const data = JSON.parse(body);
-    const latest = String(data.tag_name || '').replace(/^v/, '');
-    if (!latest) return base;
-    const result = { ...base, latest, url: data.html_url || base.url, hasUpdate: compareVersions(latest, current) > 0 };
+    const result = releaseUpdateInfo(data, current);
+    if (!result.latest) return base;
     updateCache = { at: Date.now(), data: result };
     return result;
   } catch (e) {
@@ -1179,8 +1309,9 @@ async function checkUpdate() {
 }
 
 ipcMain.handle('update:check', () => checkUpdate());
-ipcMain.handle('update:open', () => {
-  shell.openExternal('https://github.com/zhangjiabo522/dshup/releases/latest');
+ipcMain.handle('update:open', async () => {
+  const result = await checkUpdate();
+  await shell.openExternal(result.url);
 });
 
 // ---------------- 插件市场（GitHub topic: dsh-plugin + 国内镜像加速） ----------------
@@ -1297,33 +1428,52 @@ ipcMain.handle('market:speedtest', async () => {
   return { ok: true, results, fastest };
 });
 
-/** 构建 `dsh plugin --profile web <args...>` 命令（优先本地源码 checkout 的 source runner，其次 PATH 上的 dsh）。 */
 function buildPluginCommand(args) {
-  const { detectCheckout, detectDshOnPath, detectNode } = require('./bootstrap');
+  const { detectCheckout, detectDsh, detectNode } = require('./bootstrap');
   const checkout = detectCheckout();
+  const node = detectNode();
+  const cliArgs = ['plugin', '--profile', 'web', ...args];
   if (checkout && checkout.dir) {
-    const node = detectNode();
     if (!node) throw new Error('未找到可用的 Node.js，无法执行插件管理命令');
-    return { command: `"${node}" --import tsx/esm apps/cli/src/bin.ts plugin --profile web ${args}`, cwd: checkout.dir };
+    return { file: node, args: ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', ...cliArgs], cwd: checkout.dir, node };
   }
-  const dshBin = detectDshOnPath();
+  const dshBin = detectDsh();
   if (!dshBin) throw new Error('未找到 dsh 命令：请先通过客户端完成环境准备');
-  return { command: `"${dshBin}" plugin --profile web ${args}`, cwd: os.homedir() };
+  return { file: dshBin, args: cliArgs, cwd: os.homedir(), node };
 }
 
-/** 异步执行一条插件管理命令（临时 .cmd 避免 Windows 引号解析破坏），逐行转发进度。 */
-function runPluginCommand(command, cwd, sendLine) {
+async function runPluginCommand(plan, sendLine) {
   const { spawn } = require('child_process');
-  const bat = path.join(os.tmpdir(), `dsh-market-${process.pid}-${Date.now()}.cmd`);
-  fs.writeFileSync(bat, '@echo off\r\n' + command + '\r\n', 'utf8');
-  return new Promise((resolve, reject) => {
-    const child = spawn(resolveCmd(), ['/d', '/c', `"${bat}"`], {
-      cwd,
-      env: { ...process.env, PATH: withSanePath(process.env.PATH || '') },
+  const { resolveCmd, withSanePath, withRuntimePath, detectNode, detectPnpm, installPnpm } = require('./bootstrap');
+  const node = plan.node || detectNode();
+  if (!node) throw new Error('未找到可用的 Node.js，无法执行插件管理命令');
+  const pnpm = detectPnpm() || await installPnpm(node, (event) => {
+    if (event.message) sendLine(event.message);
+  });
+  const isWin = process.platform === 'win32';
+  const env = withRuntimePath(process.env, node);
+  env.PATH = [path.dirname(pnpm), env.PATH || ''].join(path.delimiter);
+  let bat = null;
+  let child;
+  if (isWin) {
+    const command = [plan.file, ...plan.args].map((value) => `"${String(value).replace(/"/g, '""')}"`).join(' ');
+    bat = path.join(os.tmpdir(), `dsh-market-${process.pid}-${Date.now()}.cmd`);
+    fs.writeFileSync(bat, '@echo off\r\n' + command + '\r\n', 'utf8');
+    child = spawn(resolveCmd(), ['/d', '/c', `"${bat}"`], {
+      cwd: plan.cwd,
+      env: withSanePath(env),
       windowsHide: false,
       windowsVerbatimArguments: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+  } else {
+    child = spawn(plan.file, plan.args, {
+      cwd: plan.cwd,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  }
+  return new Promise((resolve, reject) => {
     const onData = buf => {
       for (const line of buf.toString('utf8').split(/\r?\n/)) {
         const clean = line.replace(/\s+$/, '');
@@ -1334,7 +1484,9 @@ function runPluginCommand(command, cwd, sendLine) {
     child.stderr.on('data', onData);
     child.on('error', reject);
     child.on('close', code => {
-      try { fs.unlinkSync(bat); } catch (e) { /* ignore */ }
+      if (bat) {
+        try { fs.unlinkSync(bat); } catch (e) { /* ignore */ }
+      }
       resolve(code);
     });
   });
@@ -1346,18 +1498,14 @@ ipcMain.handle('market:install', async (_e, payload) => {
   if (marketInstalling) return { ok: false, error: '已有安装任务进行中，请稍候' };
   const repo = payload && typeof payload.repo === 'string' ? payload.repo : '';
   const mirrorId = payload && typeof payload.mirrorId === 'string' ? payload.mirrorId : '';
-  if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+/.test(repo)) {
+  if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/?$/.test(repo)) {
     return { ok: false, error: '仓库地址格式应为 https://github.com/<owner>/<repo>' };
   }
   const mirror = MARKET_MIRRORS.find(m => m.id === mirrorId) ?? MARKET_MIRRORS[0];
-  const spec = (mirror.prefix === '' ? repo : mirror.prefix + repo) + '.git';
-  const { withSanePath, resolveCmd } = require('./bootstrap');
-  let command = null;
-  let cwd = null;
+  const spec = mirror.prefix + repo.replace(/\/$/, '').replace(/\.git$/, '') + '.git';
+  let plan;
   try {
-    const plan = buildPluginCommand(`add ${spec}`);
-    command = plan.command;
-    cwd = plan.cwd;
+    plan = buildPluginCommand(['add', spec]);
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   }
@@ -1370,7 +1518,7 @@ ipcMain.handle('market:install', async (_e, payload) => {
   try {
     sendLine(`> 安装目标: ${spec}`);
     sendLine(`> 镜像: ${mirror.name}`);
-    const exitCode = await runPluginCommand(command, cwd, sendLine);
+    const exitCode = await runPluginCommand(plan, sendLine);
     if (exitCode === 0) {
       sendLine('✓ 安装完成：重启 dsh 后生效');
       return { ok: true, note: '安装完成，需要重启 dsh 生效' };
@@ -1409,15 +1557,12 @@ ipcMain.handle('market:installed', () => {
 ipcMain.handle('market:uninstall', async (_e, payload) => {
   if (marketInstalling) return { ok: false, error: '已有插件管理任务进行中，请稍候' };
   const name = payload && typeof payload.name === 'string' ? payload.name.trim() : '';
-  if (name === '' || !/^[^/]+\/?[^/]+$/.test(name) || /[;&|<>]/.test(name)) {
+  if (!/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i.test(name)) {
     return { ok: false, error: '插件名不合法' };
   }
-  let command = null;
-  let cwd = null;
+  let plan;
   try {
-    const plan = buildPluginCommand(`remove ${name}`);
-    command = plan.command;
-    cwd = plan.cwd;
+    plan = buildPluginCommand(['remove', name]);
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   }
@@ -1429,7 +1574,7 @@ ipcMain.handle('market:uninstall', async (_e, payload) => {
   };
   try {
     sendLine(`> 卸载: ${name}`);
-    const exitCode = await runPluginCommand(command, cwd, sendLine);
+    const exitCode = await runPluginCommand(plan, sendLine);
     if (exitCode === 0) {
       sendLine('✓ 卸载完成：重启 dsh 后生效');
       return { ok: true, note: '卸载完成，需要重启 dsh 生效' };
@@ -1489,18 +1634,14 @@ function dirSizeCached(dir) {
 
 /** 后台预热体积统计：启动与每次 data:info 后异步补算，界面先显示路径、体积随后就位。 */
 function warmDataSizes() {
-  const base = process.platform === 'win32'
-    ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient')
-    : path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeekHarnessClient');
+  const base = clientBaseDir();
   const targets = [path.join(base, 'runtime'), path.join(base, 'funasr'), app.getPath('userData')];
   return Promise.all(targets.map(target => dirSize(target).catch(() => 0)));
 }
 
 /** 客户端数据目录一览 + 体积（体积为后台计算的最新缓存值，未就绪时显示 0）。 */
 ipcMain.handle('data:info', () => {
-  const base = process.platform === 'win32'
-    ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient')
-    : path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeekHarnessClient');
+  const base = clientBaseDir();
   const runtime = path.join(base, 'runtime');
   const funasr = path.join(base, 'funasr');
   const userData = app.getPath('userData');
@@ -1543,7 +1684,9 @@ ipcMain.handle('data:clear-cache', async () => {
   try {
     const { session } = require('electron');
     await session.defaultSession.clearCache();
-    await session.defaultSession.clearStorageData();
+    await session.defaultSession.clearStorageData({
+      storages: ['filesystem', 'indexdb', 'localstorage', 'shadercache', 'websql', 'serviceworkers', 'cachestorage'],
+    });
     return { ok: true };
   } catch (e) {
     return { ok: false, error: String(e) };
@@ -1599,9 +1742,7 @@ let statsCache = { at: 0, data: null };
 let statsScanning = false;
 
 function statsSnapshotFile() {
-  const base = process.platform === 'win32'
-    ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient')
-    : path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeekHarnessClient');
+  const base = clientBaseDir();
   return path.join(base, 'stats-snapshot.json');
 }
 
@@ -1791,7 +1932,7 @@ ipcMain.handle('open-voice-settings', () => {
   // 语音引导：直接回到 dsh 页面，并自动打开设置面板的"语音输入"tab
   pendingVoiceSection = true;
   if (win && !win.isDestroyed()) {
-    const url = bootResult ? bootResult.url : 'http://127.0.0.1:3080/';
+    const url = bootResult ? bootResult.url : APP_URL;
     if (win.webContents.getURL() !== url) loadDshPage(12);
     else autoOpenSettingsPanel(win.webContents.mainFrame).then(() => {});
   }
@@ -1829,9 +1970,20 @@ function autoOpenSettingsPanel(frame) {
     .catch((e) => 'err: ' + e.message);
 }
 
-ipcMain.on('open-in-browser', () => {
-  const url = bootResult ? bootResult.url : 'http://127.0.0.1:3080/';
-  shell.openExternal(url);
+ipcMain.on('open-in-browser', async () => {
+  const url = bootResult ? bootResult.url : APP_URL;
+  if (bootResult?.browserUrl) {
+    await shell.openExternal(bootResult.browserUrl);
+  } else if (await require('./bootstrap').probeStatus() === 200) {
+    await shell.openExternal(url);
+  } else {
+    await require('electron').dialog.showMessageBox(win, {
+      type: 'info',
+      message: '请使用原服务启动窗口中显示的浏览器链接',
+      detail: '当前服务由其他程序启动，浏览器需要单独授权。你仍然可以在客户端中继续使用。',
+      buttons: ['知道了'],
+    });
+  }
 });
 
 // 生命周期
@@ -1892,15 +2044,20 @@ app.on('window-all-closed', () => {
   app.quit();
 });
 
-app.on('before-quit', () => {
+let stoppingOnQuit = null;
+app.on('before-quit', (event) => {
   quitting = true;
   // 只有本客户端启动的服务且用户开启"关闭时停止"时才停止；用户原本就在运行的服务保持不动
   if (bootResult && bootResult.stop && !bootResult.alreadyRunning) {
     if (readClientSettings().stopDshOnQuit) {
-      try {
-        bootResult.stop();
-      } catch (e) {
-        /* ignore */
+      event.preventDefault();
+      if (stoppingOnQuit === null) {
+        stoppingOnQuit = Promise.resolve().then(() => bootResult.stop()).catch(() => {
+          console.error('服务退出清理失败');
+        }).finally(() => {
+          bootResult = null;
+          app.quit();
+        });
       }
     }
   }

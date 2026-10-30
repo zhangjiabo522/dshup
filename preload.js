@@ -4,9 +4,14 @@
 const { contextBridge, ipcRenderer } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const { APP_URL } = require('./bootstrap');
+const { isTrustedPageUrl } = require('./desktop-platform');
+const appOrigin = new URL(APP_URL).origin;
+if (!isTrustedPageUrl(location.href, APP_URL)) return;
 
 // ---------- 对外 API ----------
 contextBridge.exposeInMainWorld('dshClient', {
+  webUrl: APP_URL,
   // 主进程引导事件
   onEvent: (cb) => {
     ipcRenderer.on('boot-event', (_event, payload) => cb(payload));
@@ -88,6 +93,7 @@ contextBridge.exposeInMainWorld('dshClient', {
       },
     },
   },
+  openSettings: () => ipcRenderer.invoke('open-settings'),
   closeSettings: () => ipcRenderer.invoke('close-settings'),
   autoOpenSettings: () => ipcRenderer.invoke('auto-open-settings-panel'),
   openVoiceSettings: () => ipcRenderer.invoke('open-voice-settings'),
@@ -130,6 +136,7 @@ const winAPI = {
   close: () => ipcRenderer.invoke('win-close'),
   isMaximized: () => ipcRenderer.invoke('win-is-maximized'),
   onMaximizedChanged: (cb) => ipcRenderer.on('maximized-changed', (_e, v) => cb(v)),
+  openSettings: () => ipcRenderer.invoke('open-settings'),
   // 等比缩小整个页面（CSS transform，保持布局、任意比例），让长页面完整显示在窗口内；再次调用恢复 100%
   fitToWindow: async () => {
     try {
@@ -169,11 +176,7 @@ const TITLEBAR_ID = 'dsh-win-titlebar';
 const TB_HEIGHT = 36;
 
 function isTargetPage() {
-  const h = location.href;
-  return (
-    h.startsWith('file:') ||
-    /^http:\/\/(127\.0\.0\.1|localhost):3080(\/|$)/.test(h)
-  );
+  return isTrustedPageUrl(location.href, APP_URL);
 }
 
 function logoDataUri() {
@@ -206,6 +209,7 @@ const ICONS = {
   restore: svg('<rect x="1.4" y="3.2" width="6.6" height="6" rx="1.6"/><path d="M3.2 3.2 V2.1 a1.6 1.6 0 0 1 1.6-1.6 H7.1 a1.6 1.6 0 0 1 1.6 1.6 V5.8 a1.6 1.6 0 0 1-1.6 1.6 H6.2"/>'),
   close: svg('<path d="M2.1 2.1 L7.9 7.9 M7.9 2.1 L2.1 7.9"/>', 11, 11),
   fit: svg('<path d="M1.5 6.4 V8.5 H3.6 M8.5 3.6 V1.5 H6.4 M3.6 1.5 H1.5 V3.6 M6.4 8.5 H8.5 V6.4"/><circle cx="5" cy="5" r="0.9" fill="currentColor" stroke="none"/>'),
+  gear: svg('<circle cx="5" cy="5" r="1.35"/><path d="M5 1.15 L5.55 2.35 L6.85 1.95 L7.35 3.2 L8.7 3.35 L8.35 4.65 L9.2 5.55 L8.05 6.35 L8.15 7.75 L6.8 7.55 L6.05 8.75 L4.95 7.85 L3.65 8.55 L3.25 7.2 L1.9 7.15 L2.35 5.85 L1.35 5.05 L2.45 4.25 L1.95 2.9 L3.3 3.05 L4.15 1.9 Z"/>'),
 };
 
 const TB_CSS = `
@@ -342,6 +346,7 @@ function bindCaptureHandlers() {
       else if (b.classList.contains('tb-max')) winAPI.toggleMaximize();
       else if (b.classList.contains('tb-min')) winAPI.minimize();
       else if (b.classList.contains('tb-fit')) winAPI.fitToWindow();
+      else if (b.classList.contains('tb-settings')) winAPI.openSettings();
     },
     true
   );
@@ -370,7 +375,7 @@ function injectTitlebar() {
   bindCaptureHandlers();
 
   // 是否为 dsh 内嵌页（http）：只保留右上角按钮，无 logo/文字，视觉完全融入页面
-  const isHttpPage = /^http:\/\/(127\.0\.0\.1|localhost):3080(\/|$)/.test(location.href);
+  const isHttpPage = (location.origin === appOrigin);
 
   const bar = document.createElement('div');
   bar.id = TITLEBAR_ID;
@@ -394,12 +399,14 @@ function injectTitlebar() {
   btns.className = 'tb-btns';
 
   const icFit = ICONS.fit.cloneNode(true);
+  const icGear = ICONS.gear.cloneNode(true);
   const icMin = ICONS.min.cloneNode(true);
   const icMax = ICONS.max.cloneNode(true);
   const icRestore = ICONS.restore.cloneNode(true);
   const icClose = ICONS.close.cloneNode(true);
 
   const fitBtn = btn('tb-fit', icFit, '适应窗口：等比缩小显示整个页面（再次点击恢复，Ctrl+0 复位缩放）');
+  const settingsBtn = btn('tb-settings', icGear, '客户端设置（dshup）');
   const minBtn = btn('tb-min', icMin, '最小化');
   const maxBtn = btn('tb-max', icMax, '最大化');
   const restoreBtn = btn('tb-max tb-ic-restore', icRestore, '还原');
@@ -408,6 +415,10 @@ function injectTitlebar() {
   // "适应窗口"按钮仅对内嵌 dsh 页面有意义
   if (isHttpPage) {
     btns.appendChild(fitBtn);
+  }
+  // 齿轮进入 dshup 自己的设置页，不是官方 dsh 网页设置
+  if (!/settings\.html/.test(location.href)) {
+    btns.appendChild(settingsBtn);
   }
   btns.appendChild(minBtn);
   btns.appendChild(maxBtn);
@@ -431,7 +442,7 @@ function injectTitlebar() {
 // 同时压缩 dsh 根容器高度（calc(100vh - 36px)），并永久隐藏 html/body 层滚动
 // （消除"窗口最右边两条滚动条"，滚动只发生在页面内部容器）。
 function applyReservedSpace() {
-  if (!/^http:\/\/(127\.0\.0\.1|localhost):3080(\/|$)/.test(location.href)) return;
+  if (!(location.origin === appOrigin)) return;
   try {
     if (document.body && getComputedStyle(document.body).paddingTop !== TB_HEIGHT + 'px') {
       document.body.style.paddingTop = TB_HEIGHT + 'px';

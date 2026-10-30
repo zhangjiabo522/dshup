@@ -19,7 +19,10 @@ const http = require('http');
 const net = require('net');
 const tls = require('tls');
 
-const PORT = 3080;
+const PORT = process.env.DSH_PORT === undefined ? 3080 : Number(process.env.DSH_PORT);
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  throw new Error('DSH_PORT 必须是 1 到 65535 之间的整数');
+}
 const APP_URL = `http://127.0.0.1:${PORT}/`;
 const NPM_MIRROR = 'https://registry.npmmirror.com';
 const NPM_OFFICIAL = 'https://registry.npmjs.org';
@@ -27,19 +30,31 @@ const NODE_MIRROR = 'https://npmmirror.com/mirrors/node';
 const NODE_OFFICIAL = 'https://nodejs.org/dist';
 const NODE_LTS_MAJOR = 22; // 需要私有安装时使用的 LTS 大版本（npmmirror 镜像）
 const PNPM_VERSION = '11.7.0'; // 与 deepseek-harness 仓库 packageManager 一致
-const DSH_PACKAGE = '@deepseek-ai/dsh@0.1.0-rc.6'; // 官方 npm 最新稳定 rc（私有目录安装，不影响用户全局）
+const DSH_PACKAGE = '@deepseek-ai/dsh@0.2.1-rc.5';
 const MAX_POLL_MS = 180000; // 等待 dsh 启动的最长时间
 const POLL_INTERVAL_MS = 1200;
 
 // ---------------- 客户端设置感知（镜像源 / 网络模式） ----------------
 // 设置文件与主进程共用：%LOCALAPPDATA%\DeepSeekHarnessClient\client-settings.json
 // （macOS：~/Library/Application Support/DeepSeekHarnessClient/client-settings.json）
+// （Linux：$XDG_DATA_HOME/DeepSeekHarnessClient 或 ~/.local/share/DeepSeekHarnessClient）
+
+function clientBaseDir() {
+  if (process.platform === 'win32') {
+    return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DeepSeekHarnessClient');
+  }
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'DeepSeekHarnessClient');
+  }
+  const configuredDataHome = process.env.XDG_DATA_HOME;
+  const dataHome = configuredDataHome && path.isAbsolute(configuredDataHome)
+    ? configuredDataHome
+    : path.join(os.homedir(), '.local', 'share');
+  return path.join(dataHome, 'DeepSeekHarnessClient');
+}
 
 function clientSettingsFile() {
-  const base = IS_WIN
-    ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
-    : path.join(os.homedir(), 'Library', 'Application Support');
-  return path.join(base, 'DeepSeekHarnessClient', 'client-settings.json');
+  return path.join(clientBaseDir(), 'client-settings.json');
 }
 
 function readClientSettings() {
@@ -64,9 +79,10 @@ function proxyAllowed() {
   return readClientSettings().proxyMode !== 'direct';
 }
 
-// 平台分支：Windows（cmd/where/注册表）与 macOS（sh/which/launchd 由 Electron API 处理）
+// 平台分支：Windows（cmd/where/注册表）、macOS（sh/which/launchd）、Linux（sh/which/XDG）
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
+const IS_LINUX = process.platform === 'linux';
 
 // 已知的本地源码仓库候选（先于 npm 安装复用；可用 DSH_CHECKOUT 环境变量覆盖）
 const CHECKOUT_CANDIDATES = () => {
@@ -81,10 +97,7 @@ const CHECKOUT_CANDIDATES = () => {
 };
 
 function runtimeDir() {
-  const base = IS_WIN
-    ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
-    : path.join(os.homedir(), 'Library', 'Application Support');
-  return path.join(base, 'DeepSeekHarnessClient', 'runtime');
+  return path.join(clientBaseDir(), 'runtime');
 }
 
 // ---------------- 事件 ----------------
@@ -134,6 +147,24 @@ function withSanePath(env) {
   } else {
     merged.PATH = system32;
   }
+  return merged;
+}
+
+/** 把私有 Node / dsh bin 放到 PATH 最前：shebang（#!/usr/bin/env node）和 dsh 子进程都能找到正确版本。 */
+function withRuntimePath(env, nodeExe) {
+  const merged = IS_WIN ? withSanePath(env || process.env) : { ...(env || process.env) };
+  const extras = [];
+  if (nodeExe) extras.push(path.dirname(nodeExe));
+  extras.push(path.join(runtimeDir(), 'node_modules', '.bin'));
+  const current = merged.PATH || '';
+  const parts = extras.concat(current.split(path.delimiter).filter(Boolean), IS_WIN ? [] : ['/usr/local/bin', '/usr/bin', '/bin']);
+  const seen = new Set();
+  merged.PATH = parts.filter((p) => {
+    const key = IS_WIN ? p.toLowerCase() : p;
+    if (!p || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).join(path.delimiter);
   return merged;
 }
 
@@ -223,6 +254,7 @@ function runCmdAsync(command, opts = {}) {
         cwd: cwd || process.cwd(),
         env: env || process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true,
       });
     }
     let stdout = '';
@@ -230,7 +262,13 @@ function runCmdAsync(command, opts = {}) {
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      try { child.kill(); } catch (e) { /* ignore */ }
+      try {
+        if (!IS_WIN && child.pid) {
+          try { process.kill(-child.pid, 'SIGTERM'); } catch (e1) { child.kill(); }
+        } else {
+          child.kill();
+        }
+      } catch (e) { /* ignore */ }
     }, timeout || 600000);
     child.stdout.on('data', (d) => {
       const text = d.toString('utf8');
@@ -429,10 +467,10 @@ async function download(url, dest, emit) {
 async function unzip(zipFile, destDir, onLine) {
   const stat = fs.statSync(zipFile);
   if (stat.size < 1000) throw new Error(`解压失败：压缩包疑似不完整（${stat.size} 字节）`);
-  if (IS_MAC || !IS_WIN) {
-    // macOS：tar（支持 gz/zip）
+  if (!IS_WIN) {
+    // macOS / Linux：tar 自动识别 gz/xz
     try {
-      await runCmdAsync(`tar -xzf "${zipFile}" -C "${destDir}"`, { timeout: 300000, onLine });
+      await runCmdAsync(`tar -xf "${zipFile}" -C "${destDir}"`, { timeout: 300000, onLine });
       return;
     } catch (e) {
       throw new Error('解压失败: ' + e.message);
@@ -550,7 +588,7 @@ function findOnPath(exe) {
     return line || null;
   }
   // macOS / 其他：which
-  const res = runExe('/usr/bin/which', [exe], { timeout: 15000 });
+  const res = runExe('/usr/bin/which', [exe], { timeout: 15000, env: withRuntimePath(process.env) });
   if (res.status !== 0) return null;
   const line = (res.stdout || '').split(/\r?\n/).map((s) => s.trim()).find((s) => s !== '');
   return line || null;
@@ -583,6 +621,17 @@ function detectDshOnPath() {
   return null;
 }
 
+function privateDshBin() {
+  return path.join(runtimeDir(), 'node_modules', '.bin', binName('dsh'));
+}
+
+/** 私有 runtime 优先，其次 PATH。客户端默认不写系统 PATH，所以必须查私有目录。 */
+function detectDsh() {
+  const privateBin = privateDshBin();
+  if (fs.existsSync(privateBin)) return privateBin;
+  return detectDshOnPath();
+}
+
 function detectCheckout() {
   for (const dir of CHECKOUT_CANDIDATES()) {
     if (!dir || !fs.existsSync(dir)) continue;
@@ -610,7 +659,60 @@ function isServerUp(port = PORT) {
   });
 }
 
-async function waitForServer(timeoutMs = MAX_POLL_MS, emit) {
+/** 探测端口上的 HTTP 状态码（dsh >= 0.2 起未认证访问根路径返回 401）。 */
+function probeStatus(port = PORT) {
+  return new Promise((resolve) => {
+    const req = http.get(`http://127.0.0.1:${port}/`, { timeout: 2500 }, (res) => {
+      res.resume();
+      resolve(res.statusCode || 0);
+    });
+    req.on('error', () => resolve(0));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(0);
+    });
+  });
+}
+
+/**
+ * dsh >= 0.2 的浏览器认证：`dsh web` 把 `?token=<launchToken>` 打进启动 URL，
+ * 带着它请求根路径会种下 HttpOnly cookie，之后才允许访问页面。
+ * 客户端内嵌窗口必须用带 token 的 URL 首次加载，否则只会看到 401 文本。
+ */
+const TOKEN_RE = /https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)\/\?token=([A-Za-z0-9_-]+)/;
+
+/** 从 `dsh web` 的输出里解析带 token 的启动 URL。 */
+function parseLaunchUrl(text) {
+  const m = TOKEN_RE.exec(String(text || ''));
+  if (!m) return null;
+  return { port: Number(m[1]), token: m[2], url: `http://127.0.0.1:${m[1]}/?token=${m[2]}` };
+}
+
+function exchangeToken(launch, timeout = 8000) {
+  return new Promise((resolve) => {
+    if (!launch || !launch.url) {
+      resolve(null);
+      return;
+    }
+    const req = http.get(launch.url, { timeout }, (res) => {
+      res.resume();
+      const setCookie = res.headers['set-cookie'];
+      resolve({
+        ok: res.statusCode === 303 || res.statusCode === 302 || res.statusCode === 200,
+        status: res.statusCode,
+        cookies: Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [],
+        url: `http://127.0.0.1:${launch.port}/`,
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+}
+
+async function waitForServer(timeoutMs = MAX_POLL_MS, emit = () => {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await isServerUp()) return true;
@@ -650,13 +752,15 @@ async function installNode(onEvent) {
     emit('log', { message: `获取 Node 版本列表失败，使用默认版本 ${version}: ${e.message}` });
   }
 
-  // Windows: win-x64.zip；macOS: darwin-arm64.tar.gz（Apple Silicon）/ darwin-x64.tar.gz
+  // Windows: win-x64.zip；macOS: darwin-arm64/x64.tar.gz；Linux: linux-arm64/x64.tar.gz
   let zipName;
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
   if (IS_WIN) {
     zipName = `node-${version}-win-x64.zip`;
-  } else {
-    const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+  } else if (IS_MAC) {
     zipName = `node-${version}-darwin-${arch}.tar.gz`;
+  } else {
+    zipName = `node-${version}-linux-${arch}.tar.gz`;
   }
   const url = `${mirrors().node}/${version}/${zipName}`;
   const zipFile = path.join(rt, zipName);
@@ -697,6 +801,7 @@ async function installPnpm(nodeExe, onEvent) {
     // 异步执行 + 实时进度（不阻塞主进程，避免新环境首启"无响应"）
     await runCmdAsync(`"${npmCmd}" install --prefix "${rt}" pnpm@${PNPM_VERSION} --registry=${mirrors().npm} --no-audit --no-fund${proxyArgs()}`, {
       timeout: 300000,
+      env: withRuntimePath(process.env, nodeExe),
       onLine: progressRelay(line => {
         emit('progress', { message: line.slice(0, 160) });
       }),
@@ -724,7 +829,8 @@ async function installDsh(nodeExe, onEvent) {
   try {
     // 异步执行 + 实时进度（不阻塞主进程，避免新环境首启"无响应"）
     await runCmdAsync(`"${npmCmd}" install --prefix "${rt}" ${DSH_PACKAGE} --registry=${mirrors().npm} --no-audit --no-fund${proxyArgs()}`, {
-      timeout: 600000,
+      timeout: 1200000,
+      env: withRuntimePath(process.env, nodeExe),
       onLine: progressRelay(line => {
         emit('progress', { message: line.slice(0, 160) });
       }),
@@ -744,9 +850,7 @@ async function installDsh(nodeExe, onEvent) {
 
 async function prepareToStart(onEvent) {
   const emit = createEmitter(onEvent);
-  // 返回 { command, cwd, env }
   const nodeExe = detectNode();
-  let pnpm = detectPnpm();
 
   // 1) 本地源码仓库（已构建）优先 —— 不重复下载
   const checkout = detectCheckout();
@@ -757,27 +861,29 @@ async function prepareToStart(onEvent) {
       let node = nodeExe;
       if (!node) node = await installNode(onEvent);
       emit('status', { message: `使用本地源码仓库启动: ${checkout.dir}` });
-      // 用 node 绝对路径 + tsx 直接跑 dsh 源码（与官方 `dsh` 脚本相同）。
-      // 完全绕开 pnpm（corepack shim 依赖 PATH 里的 node，开机自启等 PATH 残缺场景会失败），
-      // 且不修改 PATH（避免污染 dsh 进程环境）。
-      return { command: `"${node}" --import tsx/esm apps/cli/src/bin.ts web`, cwd: checkout.dir, env: { ...process.env } };
+      return {
+        command: `"${node}" --import tsx/esm apps/cli/src/bin.ts web --no-open --port ${PORT}`,
+        file: node,
+        args: ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web', '--no-open', '--port', String(PORT)],
+        cwd: checkout.dir,
+        env: withRuntimePath(process.env, node),
+      };
     }
   }
 
-  // 2) PATH 上已有 dsh
-  const dshOnPath = detectDshOnPath();
-  if (dshOnPath) {
-    emit('status', { message: '检测到已安装的 dsh，直接启动' });
-    return { command: 'dsh web', cwd: os.homedir(), env: { ...process.env } };
-  }
-
-  // 3) 私有安装 / 全新安装
+  // 2/3) 已有 dsh（私有 runtime 优先，其次 PATH）或全新安装
   let node = nodeExe;
   if (!node) node = await installNode(onEvent);
-  pnpm = pnpm || detectPnpm(); // 不需要 pnpm 时跳过
-  const dshBin = await installDsh(node, onEvent);
+  let dshBin = detectDsh();
+  if (!dshBin) dshBin = await installDsh(node, onEvent);
   emit('status', { message: '启动 DeepSeek Harness Web…' });
-  return { command: `"${dshBin}" web`, cwd: os.homedir(), env: { ...process.env } };
+  return {
+    command: `"${dshBin}" web --no-open --port ${PORT}`,
+    file: dshBin,
+    args: ['web', '--no-open', '--port', String(PORT)],
+    cwd: os.homedir(),
+    env: withRuntimePath({ ...process.env }, node),
+  };
 }
 
 function spawnServer(plan, emit) {
@@ -798,40 +904,117 @@ function spawnServer(plan, emit) {
     child.on('close', () => {
       try { fs.unlinkSync(bat); } catch (e) { /* ignore */ }
     });
-    attachServerLogs(child, emit);
+    attachServerLogs(child, emit, plan.onLaunchUrl);
     return child;
   }
-  // macOS / 其他：/bin/bash -c
-  const child = spawn('/bin/bash', ['-c', plan.command], {
+  const child = spawn(plan.file, plan.args, {
     cwd: plan.cwd,
     env: plan.env || process.env,
     stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
   });
-  attachServerLogs(child, emit);
+  attachServerLogs(child, emit, plan.onLaunchUrl);
   return child;
 }
 
-function attachServerLogs(child, emit) {
-  const push = (buf) => {
-    const text = (buf || '').toString().trim();
-    if (text) emit('server', { message: text });
+function attachServerLogs(child, emit, onLaunchUrl) {
+  const push = (line) => {
+    const text = line.trim();
+    if (!text) return;
+    if (onLaunchUrl) {
+      const parsed = parseLaunchUrl(text);
+      if (parsed && parsed.port === PORT) onLaunchUrl(parsed);
+    }
+    emit('server', { message: text.replace(/([?&]token=)[^\s\x1b]+/g, '$1[已隐藏]') });
   };
-  child.stdout.on('data', push);
-  child.stderr.on('data', push);
+  for (const stream of [child.stdout, child.stderr]) {
+    if (!stream) continue;
+    let pending = '';
+    let truncated = false;
+    stream.setEncoding('utf8');
+    stream.on('data', (chunk) => {
+      pending += chunk;
+      let end;
+      while ((end = pending.indexOf('\n')) >= 0) {
+        if (!truncated) push(pending.slice(0, end));
+        truncated = false;
+        pending = pending.slice(end + 1);
+      }
+      if (pending.length > 65536) {
+        pending = '';
+        truncated = true;
+      }
+    });
+    stream.on('end', () => { if (!truncated) push(pending); });
+  }
   child.on('error', (e) => emit('error', { message: '启动进程失败: ' + e.message }));
 }
 
-function killProcessTree(pid) {
-  try {
-    if (IS_WIN) {
-      runCmd(`taskkill /PID ${pid} /T /F`, { timeout: 15000 });
-    } else {
-      // macOS：先杀子进程再杀本进程
-      runCmd(`pkill -TERM -P ${pid} 2>/dev/null; kill -TERM ${pid} 2>/dev/null; sleep 1; kill -KILL ${pid} 2>/dev/null`, { timeout: 15000 });
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function trackServer(child) {
+  let stopped = false;
+  let closed = false;
+  let cleanupComplete = false;
+  let stopPromise = null;
+  let failure = null;
+  let resolveExit;
+  const exited = new Promise((resolve) => { resolveExit = resolve; });
+  const signal = (name) => {
+    if (!child.pid || cleanupComplete || (IS_WIN && closed)) return;
+    try {
+      if (IS_WIN) {
+        const killer = spawn(resolveCmd(), ['/d', '/c', `taskkill /PID ${child.pid} /T /F`], {
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+        killer.on('error', () => {});
+      } else {
+        process.kill(-child.pid, name);
+      }
+    } catch (e) {}
+  };
+  const active = () => {
+    if (!child.pid || cleanupComplete) return false;
+    if (IS_WIN) return !closed;
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (e) {
+      return e.code !== 'ESRCH';
     }
-  } catch (e) {
-    /* ignore */
-  }
+  };
+  child.once('error', (error) => {
+    failure = error;
+    resolveExit();
+  });
+  child.once('exit', (code, sig) => {
+    failure = new Error(`dsh 进程已退出（${sig || code}）`);
+    resolveExit();
+    if (!stopped) void stop();
+  });
+  child.once('close', () => {
+    closed = true;
+  });
+  const stop = () => {
+    if (stopPromise) return stopPromise;
+    stopped = true;
+    signal('SIGTERM');
+    stopPromise = (async () => {
+      const deadline = Date.now() + 1500;
+      while (active() && Date.now() < deadline) await delay(50);
+      if (active()) {
+        signal('SIGKILL');
+        const killDeadline = Date.now() + 1500;
+        while (active() && Date.now() < killDeadline) await delay(50);
+      }
+      cleanupComplete = true;
+    })();
+    return stopPromise;
+  };
+  return { child, exited, stop, get failure() { return failure; } };
 }
 
 // ---------------- 主流程 ----------------
@@ -840,55 +1023,306 @@ function killProcessTree(pid) {
  * 执行完整引导流程。
  * @param {object} opts
  * @param {(event:object)=>void} [opts.onEvent]
- * @param {boolean} [opts.killOnExit] 退出时是否结束由本客户端启动的服务进程（默认 true）
  * @returns {Promise<{url:string, alreadyRunning:boolean, process:ChildProcess|null, stop:Function}>}
  */
+
+// ---------------- dshup 客户端插件（注入官方 Web 左下角「设置」与输入栏） ----------------
+
+const DSHUP_PLUGIN_ID = 'dshup-client-settings';
+
+function dshHomeDir() {
+  return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+}
+
+function dshupPluginSourceDir() {
+  return path.join(__dirname, 'plugin', DSHUP_PLUGIN_ID);
+}
+
+function copyDirOverwrite(src, dest) {
+  fs.mkdirSync(dest, { recursive: true });
+  let entries;
+  try {
+    entries = fs.readdirSync(src, { withFileTypes: true });
+  } catch (e) {
+    return;
+  }
+  for (const ent of entries) {
+    if (ent.name === 'node_modules' || ent.name === '.git') continue;
+    const from = path.join(src, ent.name);
+    const to = path.join(dest, ent.name);
+    if (ent.isDirectory()) {
+      copyDirOverwrite(from, to);
+    } else {
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      fs.copyFileSync(from, to);
+    }
+  }
+}
+
+function ensureCordisPatch(file) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); } catch (e) { text = ''; }
+  if (text.includes(DSHUP_PLUGIN_ID)) return false;
+  const block = `- insert:\n    - id: ${DSHUP_PLUGIN_ID}\n      name: ${DSHUP_PLUGIN_ID}\n`;
+  const trimmedLines = text.split(/\r?\n/);
+  const hasYamlItem = trimmedLines.some((line) => /^\s*-\s/.test(line));
+  if (!text.trim()) {
+    fs.writeFileSync(file, block, 'utf8');
+    return true;
+  }
+  if (!hasYamlItem && /\[\s*\]/.test(text)) {
+    text = text.replace(/\[\s*\]/, block.trimEnd());
+    if (!text.endsWith('\n')) text += '\n';
+    fs.writeFileSync(file, text, 'utf8');
+    return true;
+  }
+  if (!text.endsWith('\n')) text += '\n';
+  fs.writeFileSync(file, text + block, 'utf8');
+  return true;
+}
+
+function ensureDshupClientPlugin(emit) {
+  const log = (message) => { if (emit) emit('log', { message }); };
+  const src = dshupPluginSourceDir();
+  if (!fs.existsSync(src)) {
+    log('未找到内置 dshup-client-settings 插件目录，跳过注入');
+    return { copied: false, patched: false };
+  }
+  const dest = path.join(dshHomeDir(), 'profiles', 'node_modules', DSHUP_PLUGIN_ID);
+  try {
+    copyDirOverwrite(src, dest);
+    log(`已安装客户端插件: ${dest}`);
+  } catch (e) {
+    log('复制客户端插件失败: ' + (e && e.message ? e.message : e));
+  }
+  const patchFile = path.join(dshHomeDir(), 'profiles', 'web', 'cordis.patch.yml');
+  try {
+    if (ensureCordisPatch(patchFile)) log('已写入 web 配置补丁: ' + patchFile);
+  } catch (e) {
+    log('写入 cordis.patch.yml 失败: ' + (e && e.message ? e.message : e));
+  }
+  // dsh >= 0.2 的输入栏把 conversation.input.right 排在 model 槽位之前，
+  // 旧版靠改 npm 包源码调整顺序的补丁已无必要（且会破坏包完整性校验），这里不再做。
+  return { copied: true };
+}
+
+function cookieHeader(cookies = []) {
+  return cookies.map((cookie) => String(cookie).split(';')[0].trim()).filter(Boolean).join('; ');
+}
+
+function fetchPage(url, timeout = 4000, headers = null) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const req = http.get(url, { headers: headers || {} }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > 16 * 1024 * 1024) {
+          req.destroy();
+          finish({ status: 0, html: '' });
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => finish({ status: res.statusCode || 0, html: Buffer.concat(chunks).toString('utf8') }));
+      res.on('error', () => finish({ status: 0, html: '' }));
+      res.on('aborted', () => finish({ status: 0, html: '' }));
+    });
+    req.on('error', () => finish({ status: 0, html: '' }));
+    timer = setTimeout(() => {
+      req.destroy();
+      finish({ status: 0, html: '' });
+    }, timeout);
+  });
+}
+
+async function fetchHtml(url, timeout = 4000, headers = null) {
+  return (await fetchPage(url, timeout, headers)).html;
+}
+
+async function htmlHasDshupPlugin(auth = null) {
+  const url = typeof auth === 'string' ? auth : APP_URL;
+  const headers = auth && auth.cookies ? { Cookie: cookieHeader(auth.cookies) } : null;
+  const page = await fetchPage(url, 4000, headers);
+  return page.status === 200 && page.html.includes(DSHUP_PLUGIN_ID);
+}
+
+async function authenticate(launch, timeout = 8000) {
+  if (!launch) return null;
+  const result = await exchangeToken(launch, timeout);
+  if (!result || !result.ok || result.cookies.length === 0) return null;
+  return result;
+}
+
+function isPortListening(port = PORT) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    const finish = (listening) => {
+      socket.destroy();
+      resolve(listening);
+    };
+    socket.setTimeout(1000);
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+    socket.once('timeout', () => finish(true));
+  });
+}
+
+function isDshPage(page) {
+  return page.status === 200 && /__DSH_BOOT__|dshup-client-settings|<title>\s*DeepSeek Harness\s*<\/title>/i.test(page.html);
+}
+
+async function waitForLaunch(ready, record, timeout) {
+  let timer;
+  try {
+    return await Promise.race([
+      ready,
+      record.exited.then(() => { throw record.failure; }),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), timeout); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function bootstrap(opts = {}) {
   const emit = createEmitter(opts.onEvent);
   const startedAt = Date.now();
-
-  // 0) 已在运行？
-  if (await isServerUp()) {
+  const authCookies = opts.authCookies || [];
+  if (!Array.isArray(authCookies) || authCookies.some((cookie) => typeof cookie !== 'string' || /[\r\n]/.test(cookie))) {
+    throw new Error('authCookies 必须是有效的 Cookie 字符串数组');
+  }
+  const existing = await fetchPage(APP_URL, 1500, { Cookie: cookieHeader(authCookies) });
+  if (existing.status || await isPortListening()) {
+    if (existing.status === 401 || existing.status === 403) {
+      throw new Error(`端口 ${PORT} 已有需要授权的 dsh 服务，当前客户端没有有效登录状态。请先关闭该服务，再重试；已有进程未被结束。`);
+    }
+    if (!isDshPage(existing)) {
+      throw new Error(`端口 ${PORT} 已被其他服务占用。请关闭该服务，或通过 DSH_PORT 选择其他端口；已有进程未被结束。`);
+    }
+    if (!existing.html.includes(DSHUP_PLUGIN_ID)) {
+      emit('log', { message: '复用已有 dsh 服务；该实例未加载客户端插件，部分桌面设置入口可能不可用。' });
+    }
     emit('status', { message: `检测到 dsh 已在运行（${APP_URL}）` });
-    return { url: APP_URL, alreadyRunning: true, process: null, stop: () => {} };
+    return { url: APP_URL, launchUrl: null, browserUrl: authCookies.length ? null : APP_URL, token: null, cookies: authCookies, alreadyRunning: true, process: null, stop: async () => {} };
   }
 
-  // 1) 准备启动命令
+  ensureDshupClientPlugin(emit);
   const plan = await prepareToStart(opts.onEvent);
   emit('log', { message: `启动命令: ${plan.command} (cwd=${plan.cwd})` });
+  const startupTimeout = Number.isFinite(opts.startupTimeoutMs) && opts.startupTimeoutMs > 0 ? opts.startupTimeoutMs : MAX_POLL_MS;
+  const authTimeout = Number.isFinite(opts.authTimeoutMs) && opts.authTimeoutMs > 0 ? opts.authTimeoutMs : 8000;
+  let current = null;
 
-  // 2) 启动服务
-  const child = spawnServer(plan, emit);
-
-  // 3) 等待就绪
-  const up = await waitForServer(MAX_POLL_MS, emit);
-  if (!up) {
-    killProcessTree(child.pid);
-    throw new Error('等待 dsh 服务启动超时（180 秒）。请查看日志窗口了解详情。');
-  }
-
-  const stop = () => {
-    try {
-      if (child && child.pid) killProcessTree(child.pid);
-    } catch (e) {
-      /* ignore */
+  const startChild = async () => {
+    let launch = null;
+    let resolveLaunch;
+    const launchReady = new Promise((resolve) => { resolveLaunch = resolve; });
+    const child = spawnServer({ ...plan, onLaunchUrl: (parsed) => {
+      if (launch) return;
+      launch = parsed;
+      resolveLaunch(parsed);
+      emit('log', { message: '已获取 dsh 访问令牌' });
+    } }, emit);
+    const record = trackServer(child);
+    current = record;
+    const deadline = Date.now() + startupTimeout;
+    let page = { status: 0, html: '' };
+    let lastStatus = 0;
+    let auth = null;
+    while (Date.now() < deadline) {
+      if (record.failure) throw record.failure;
+      page = await fetchPage(
+        APP_URL,
+        Math.min(1000, Math.max(1, deadline - Date.now())),
+        auth ? { Cookie: cookieHeader(auth.cookies) } : null,
+      );
+      if (record.failure) throw record.failure;
+      if (page.status) lastStatus = page.status;
+      if ((page.status === 401 || page.status === 403) && !auth) {
+        if (!launch) {
+          launch = await waitForLaunch(launchReady, record, Math.min(authTimeout, Math.max(1, deadline - Date.now())));
+        }
+        if (!launch) throw new Error('dsh 需要浏览器授权，但未获取到启动令牌。请查看日志后重试。');
+        auth = await authenticate(launch, Math.min(8000, Math.max(1, deadline - Date.now())));
+        if (record.failure) throw record.failure;
+        if (!auth) throw new Error('dsh 浏览器授权失败，启动令牌未能换取有效登录状态。请重试。');
+        emit('log', { message: '已完成 dsh 浏览器授权' });
+        continue;
+      }
+      if (isDshPage(page)) {
+        return { record, auth, browserUrl: launch ? launch.url : APP_URL, hasPlugin: page.html.includes(DSHUP_PLUGIN_ID) };
+      }
+      emit('status', { message: '等待 dsh 服务就绪…' });
+      await Promise.race([delay(Math.min(200, Math.max(1, deadline - Date.now()))), record.exited]);
     }
+    if (record.failure) throw record.failure;
+    const seconds = Math.ceil(startupTimeout / 1000);
+    if (!lastStatus) throw new Error(`等待 dsh 服务启动超时（${seconds} 秒），未收到 HTTP 响应。请查看日志窗口了解详情。`);
+    if (auth && (lastStatus === 401 || lastStatus === 403)) {
+      throw new Error(`dsh 浏览器授权未生效（HTTP ${lastStatus}），等待 ${seconds} 秒后仍无法访问页面。请重试。`);
+    }
+    throw new Error(`等待 dsh 页面就绪超时（${seconds} 秒，最后 HTTP ${lastStatus}）。服务仍未返回可用页面，请查看日志后重试。`);
   };
-  emit('status', { message: `dsh 已就绪，共耗时 ${Math.round((Date.now() - startedAt) / 1000)} 秒` });
-  return { url: APP_URL, alreadyRunning: false, process: child, stop };
+
+  try {
+    let started = await startChild();
+    if (!started.hasPlugin) {
+      ensureDshupClientPlugin(emit);
+      emit('status', { message: '客户端插件尚未进入页面，正在重启本客户端启动的 dsh…' });
+      await started.record.stop();
+      started = await startChild();
+      if (!started.hasPlugin) emit('log', { message: 'dsh 已就绪，但客户端插件未能加载；请检查插件配置。' });
+    }
+    emit('status', { message: `dsh 已就绪，共耗时 ${Math.round((Date.now() - startedAt) / 1000)} 秒` });
+    return {
+      url: APP_URL,
+      launchUrl: null,
+      browserUrl: started.browserUrl,
+      cookies: started.auth ? started.auth.cookies : [],
+      token: null,
+      alreadyRunning: false,
+      process: started.record.child,
+      stop: started.record.stop,
+    };
+  } catch (error) {
+    if (current) await current.stop();
+    throw error;
+  }
 }
+
 
 module.exports = {
   PORT,
   APP_URL,
   bootstrap,
   isServerUp,
+  ensureDshupClientPlugin,
+  htmlHasDshupPlugin,
   runtimeDir,
+  clientBaseDir,
   detectNode,
   detectPnpm,
   detectCheckout,
   detectDshOnPath,
+  detectDsh,
+  privateDshBin,
+  withRuntimePath,
   waitForServer,
+  parseLaunchUrl,
+  fetchHtml,
+  probeStatus,
+  exchangeToken,
+  authenticate,
   installNode,
   installPnpm,
   installDsh,

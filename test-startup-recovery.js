@@ -8,7 +8,7 @@ const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { pathToFileURL } = require('node:url');
 
-const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8').replace(/\r\n/g, '\n');
 
 function loadRecovery(options = {}) {
   const calls = { pages: [], urls: [], events: [], logs: [], exits: [], cookieWrites: [], stopped: 0 };
@@ -219,11 +219,14 @@ test('保存登录状态失败时停止已启动服务并保留认证错误', as
   assert.deepEqual(calls.pages, [context.SPLASH]);
 });
 
-function healthDocument(buttons, text) {
+function healthDocument(buttons, text, bootText = '') {
   return { body: { cloneNode() {
     let titlebarPresent = true;
     return {
       get textContent() { return text + (titlebarPresent ? 'DeepSeek Harness 标题栏最小化最大化设置关闭' : ''); },
+      querySelector(selector) {
+        return selector === '#root > [data-dsh-boot]' && bootText ? { textContent: bootText } : null;
+      },
       querySelectorAll(selector) {
         if (selector === 'button') return Array.from({ length: buttons + (titlebarPresent ? 4 : 0) });
         return [{ remove() { titlebarPresent = false; } }];
@@ -253,4 +256,26 @@ test('四个实际内容按钮及有效正文能通过健康检查', async () =>
   assert.deepEqual(calls.pages, []);
   assert.equal(context.lastBootError, '');
   assert.equal(context.win.webContents.getURL(), result.url);
+});
+
+test('聊天内容中的插件报错文字不影响正常页面', async () => {
+  const document = healthDocument(4, '请修复 Failed to load plugins，我在聊天中贴出了错误');
+  const { context, calls, result, runTimers } = loadRecovery({ evaluate: script => vm.runInNewContext(script, { document }) });
+  context.bootResult = result;
+  context.loadDshPage(0);
+  await settle();
+  await runTimers(2500);
+  assert.deepEqual(calls.pages, []);
+  assert.equal(context.lastBootError, '');
+});
+
+test('官方启动容器中的插件加载错误会返回启动页', async () => {
+  const document = healthDocument(4, 'HARNESS Failed to load plugins', 'Failed to load plugins');
+  const { context, calls, result, runTimers } = loadRecovery({ evaluate: script => vm.runInNewContext(script, { document }) });
+  context.bootResult = result;
+  context.loadDshPage(0);
+  await settle();
+  await runTimers(2500);
+  assert.deepEqual(calls.pages, [context.SPLASH]);
+  assert.match(context.lastBootError, /插件加载失败/);
 });

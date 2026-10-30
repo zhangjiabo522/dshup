@@ -251,7 +251,7 @@ function runCmdAsync(command, opts = {}) {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } else {
-      child = spawn('/bin/sh', ['-c', command], {
+      child = spawn(opts.args ? command : '/bin/sh', opts.args || ['-c', command], {
         cwd: cwd || process.cwd(),
         env: env || process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -335,6 +335,16 @@ function proxyArgs() {
   if (!proxyAllowed()) return '';
   const p = detectProxy();
   return p ? ` --proxy="${p}" --https-proxy="${p}"` : '';
+}
+
+function runNpmInstall(npmCmd, prefix, spec, opts) {
+  if (IS_WIN) {
+    return runCmdAsync(`"${npmCmd}" install --prefix "${prefix}" ${spec} --registry=${mirrors().npm} --no-audit --no-fund${proxyArgs()}`, opts);
+  }
+  const proxy = proxyAllowed() ? detectProxy() : null;
+  const args = ['install', '--prefix', prefix, spec, `--registry=${mirrors().npm}`, '--no-audit', '--no-fund'];
+  if (proxy) args.push(`--proxy=${proxy}`, `--https-proxy=${proxy}`);
+  return runCmdAsync(npmCmd, { ...opts, args });
 }
 
 function connectTunnel(proxyHost, proxyPort, targetHost, targetPort) {
@@ -843,7 +853,7 @@ async function installPnpm(nodeExe, onEvent) {
   let lastErr = null;
   try {
     // 异步执行 + 实时进度（不阻塞主进程，避免新环境首启"无响应"）
-    await runCmdAsync(`"${npmCmd}" install --prefix "${rt}" pnpm@${PNPM_VERSION} --registry=${mirrors().npm} --no-audit --no-fund${proxyArgs()}`, {
+    await runNpmInstall(npmCmd, rt, `pnpm@${PNPM_VERSION}`, {
       timeout: 300000,
       env: withRuntimePath(process.env, nodeExe),
       onLine: progressRelay(line => {
@@ -875,7 +885,7 @@ async function installDsh(nodeExe, onEvent) {
   let lastErr = null;
   try {
     // 异步执行 + 实时进度（不阻塞主进程，避免新环境首启"无响应"）
-    await runCmdAsync(`"${npmCmd}" install --prefix "${rt}" ${DSH_PACKAGE} --registry=${mirrors().npm} --no-audit --no-fund${proxyArgs()}`, {
+    await runNpmInstall(npmCmd, rt, DSH_PACKAGE, {
       timeout: 1200000,
       env: withRuntimePath(process.env, nodeExe),
       onLine: progressRelay(line => {

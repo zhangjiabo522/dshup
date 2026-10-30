@@ -7,7 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 function loadLifecycle(options = {}) {
-  const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   const functions = ['showWindow', 'handleSecondInstance', 'startBackgroundClient'].map(name => {
     let start = source.indexOf(`function ${name}(`);
     assert.ok(start >= 0);

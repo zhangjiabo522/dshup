@@ -9,7 +9,7 @@ const http = require('node:http');
 const net = require('node:net');
 const html = '<!doctype html><script>window.__DSH_BOOT__ = {};</script>';
 const fixtureScript = path.join(__dirname, 'test', 'fixtures', 'fake-dsh.cjs');
-const envKeys = ['HOME', 'USERPROFILE', 'LOCALAPPDATA', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'DSH_HOME', 'DSH_CHECKOUT', 'DSH_PORT', 'PATH', 'DSH_TEST_STATE', 'DSH_TEST_SCENARIO'];
+const envKeys = ['HOME', 'USERPROFILE', 'LOCALAPPDATA', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'DSH_HOME', 'DSH_CHECKOUT', 'DSH_PORT', 'PATH', 'DSH_TEST_STATE', 'DSH_TEST_SCENARIO', 'HTTPS_PROXY'];
 
 async function listen(server, port = 0) {
   await new Promise((resolve, reject) => {
@@ -30,11 +30,12 @@ async function withFixture(scenario, fn) {
   const reservation = net.createServer();
   const port = await listen(reservation);
   await close(reservation);
-  const home = path.join(root, 'home with $space');
+  const specialPath = 'with $space \'单引号\' "双引号" `false` $(false)';
+  const home = path.join(root, `home ${specialPath}`);
   fs.mkdirSync(home, { recursive: true });
   Object.assign(process.env, {
     HOME: home, USERPROFILE: home, LOCALAPPDATA: path.join(root, 'local'),
-    XDG_DATA_HOME: path.join(root, 'data'), XDG_CONFIG_HOME: path.join(root, 'config'), XDG_CACHE_HOME: path.join(root, 'cache'),
+    XDG_DATA_HOME: path.join(root, `data ${specialPath}`), XDG_CONFIG_HOME: path.join(root, 'config'), XDG_CACHE_HOME: path.join(root, 'cache'),
     DSH_HOME: path.join(root, 'dsh'), DSH_CHECKOUT: path.join(root, 'absent-checkout'),
     DSH_PORT: String(port), DSH_TEST_STATE: root, DSH_TEST_SCENARIO: scenario, PATH: '',
   });
@@ -133,6 +134,21 @@ test('启动与认证在隔离目录和回环网络中验证', { skip: process.p
       });
       assert.ok(events.some((message) => message.includes(`0.1.0-rc.6 → ${api.MIN_PRIVATE_DSH_VERSION}`)));
       assert.ok(events.indexOf('客户端私有 DeepSeek Harness 已升级') < events.indexOf('启动 DeepSeek Harness Web…'));
+    });
+  });
+  await t.test('私有 pnpm 安装保留特殊路径与代理参数，不进行 shell 展开', async () => {
+    await withFixture('pnpm', async ({ api, root }) => {
+      fakeNpm(api);
+      const proxy = 'http://user:$space@127.0.0.1:9';
+      process.env.HTTPS_PROXY = proxy;
+      const installed = await api.installPnpm(api.detectNode());
+      assert.equal(installed, path.join(api.runtimeDir(), 'node_modules', '.bin', 'pnpm'));
+      assert.ok(fs.existsSync(installed));
+      const args = state(root, 'npm-args.json');
+      assert.equal(args[args.indexOf('--prefix') + 1], api.runtimeDir());
+      assert.ok(args.includes(`--proxy=${proxy}`));
+      assert.ok(args.includes(`--https-proxy=${proxy}`));
+      assert.equal(state(root, 'npm-install.json').spec, 'pnpm@11.7.0');
     });
   });
   for (const scenario of ['upgrade-fails', 'upgrade-stale']) {

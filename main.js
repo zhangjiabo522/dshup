@@ -1144,7 +1144,8 @@ function loadDshPage(retriesLeft = 12) {
         if (!body) return false;
         body.querySelectorAll('#dsh-win-titlebar, script, style').forEach(node => node.remove());
         const text = (body.textContent || '').trim();
-        if (/Failed to load plugins/i.test(text)) return 'plugins';
+        const bootText = body.querySelector('#root > [data-dsh-boot]')?.textContent || '';
+        if (/Failed to load plugins/i.test(bootText)) return 'plugins';
         return body.querySelectorAll('button').length > 3 && text.length > 20 && !text.startsWith('dsh web authentication required');
       })()`).catch(() => false);
       if (serial !== pageLoadSerial || settingsRequested) return;

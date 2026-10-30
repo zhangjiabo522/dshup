@@ -7,13 +7,20 @@ const root = process.env.DSH_TEST_STATE;
 const prefix = args[args.indexOf('--prefix') + 1];
 const relative = prefix && path.relative(root, prefix);
 if (!prefix || path.isAbsolute(relative) || relative.startsWith('..')) process.exit(19);
-const spec = args.find((arg) => arg.startsWith('@deepseek-ai/dsh@'));
+const spec = args.find((arg) => arg.startsWith('@deepseek-ai/dsh@') || arg.startsWith('pnpm@'));
 fs.writeFileSync(path.join(root, 'npm-install.json'), JSON.stringify({ prefix, spec, command: args[0] }));
+fs.writeFileSync(path.join(root, 'npm-args.json'), JSON.stringify(args));
 if (process.env.DSH_TEST_SCENARIO === 'upgrade-fails') {
   process.stderr.write('模拟安装失败\n');
   process.exit(3);
 }
 if (process.env.DSH_TEST_SCENARIO === 'upgrade-stale') process.exit(0);
+if (spec.startsWith('pnpm@')) {
+  const bin = path.join(prefix, 'node_modules', '.bin', 'pnpm');
+  fs.mkdirSync(path.dirname(bin), { recursive: true });
+  fs.writeFileSync(bin, '', { mode: 0o755 });
+  process.exit(0);
+}
 const file = path.join(prefix, 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
 fs.mkdirSync(path.dirname(file), { recursive: true });
 fs.writeFileSync(file, JSON.stringify({ name: '@deepseek-ai/dsh', version: spec.slice(spec.lastIndexOf('@') + 1) }));

@@ -31,6 +31,7 @@ const NODE_OFFICIAL = 'https://nodejs.org/dist';
 const NODE_LTS_MAJOR = 22; // 需要私有安装时使用的 LTS 大版本（npmmirror 镜像）
 const PNPM_VERSION = '11.7.0'; // 与 deepseek-harness 仓库 packageManager 一致
 const DSH_PACKAGE = '@deepseek-ai/dsh@0.2.1-rc.5';
+const MIN_PRIVATE_DSH_VERSION = DSH_PACKAGE.slice(DSH_PACKAGE.lastIndexOf('@') + 1);
 const MAX_POLL_MS = 180000; // 等待 dsh 启动的最长时间
 const POLL_INTERVAL_MS = 1200;
 
@@ -625,6 +626,49 @@ function privateDshBin() {
   return path.join(runtimeDir(), 'node_modules', '.bin', binName('dsh'));
 }
 
+function compareDshVersions(left, right) {
+  const parse = (value) => {
+    if (typeof value !== 'string') return null;
+    const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(value);
+    if (!match) return null;
+    const pre = match[4] ? match[4].split('.') : [];
+    if (pre.some((part) => /^0\d+$/.test(part))) return null;
+    return { core: match.slice(1, 4).map(BigInt), pre };
+  };
+  const a = parse(left);
+  const b = parse(right);
+  if (!a || !b) return null;
+  for (let i = 0; i < 3; i += 1) {
+    if (a.core[i] !== b.core[i]) return a.core[i] < b.core[i] ? -1 : 1;
+  }
+  if (!a.pre.length || !b.pre.length) return a.pre.length === b.pre.length ? 0 : a.pre.length ? -1 : 1;
+  for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i += 1) {
+    if (a.pre[i] === undefined) return -1;
+    if (b.pre[i] === undefined) return 1;
+    if (a.pre[i] === b.pre[i]) continue;
+    const aNumeric = /^\d+$/.test(a.pre[i]);
+    const bNumeric = /^\d+$/.test(b.pre[i]);
+    if (aNumeric && bNumeric) return BigInt(a.pre[i]) < BigInt(b.pre[i]) ? -1 : 1;
+    if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+    return a.pre[i] < b.pre[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+function privateDshVersion() {
+  try {
+    const file = path.join(runtimeDir(), 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return typeof pkg.version === 'string' ? pkg.version : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function privateDshNeedsUpgrade() {
+  return compareDshVersions(privateDshVersion(), MIN_PRIVATE_DSH_VERSION) === -1;
+}
+
 /** 私有 runtime 优先，其次 PATH。客户端默认不写系统 PATH，所以必须查私有目录。 */
 function detectDsh() {
   const privateBin = privateDshBin();
@@ -821,9 +865,12 @@ async function installDsh(nodeExe, onEvent) {
   const emit = createEmitter(onEvent);
   const rt = runtimeDir();
   const bin = path.join(rt, 'node_modules', '.bin', binName('dsh'));
-  if (fs.existsSync(bin)) return bin;
+  const upgrading = fs.existsSync(bin) && privateDshNeedsUpgrade();
+  if (fs.existsSync(bin) && !upgrading) return bin;
 
-  emit('status', { message: `安装 ${DSH_PACKAGE}（国内镜像，私有目录）…` });
+  emit('status', { message: upgrading
+    ? `正在升级客户端私有 DeepSeek Harness：${privateDshVersion()} → ${MIN_PRIVATE_DSH_VERSION}…`
+    : `安装 ${DSH_PACKAGE}（私有目录）…` });
   const npmCmd = path.join(path.dirname(nodeExe), binName('npm'));
   let lastErr = null;
   try {
@@ -842,7 +889,14 @@ async function installDsh(nodeExe, onEvent) {
   if (!fs.existsSync(bin)) {
     throw new Error(`dsh 安装失败: ${lastErr ? lastErr.message : '未生成 ' + binName('dsh')}`);
   }
-  emit('status', { message: 'DeepSeek Harness 已安装到私有目录' });
+  if (upgrading) {
+    const installed = privateDshVersion();
+    const comparison = compareDshVersions(installed, MIN_PRIVATE_DSH_VERSION);
+    if (comparison === null || comparison < 0) {
+      throw new Error(`dsh 私有运行时升级失败：${lastErr ? lastErr.message : `安装后版本仍为 ${installed || '未知'}，需要 ${MIN_PRIVATE_DSH_VERSION} 或更新版本`}`);
+    }
+  }
+  emit('status', { message: upgrading ? '客户端私有 DeepSeek Harness 已升级' : 'DeepSeek Harness 已安装到私有目录' });
   return bin;
 }
 
@@ -875,7 +929,7 @@ async function prepareToStart(onEvent) {
   let node = nodeExe;
   if (!node) node = await installNode(onEvent);
   let dshBin = detectDsh();
-  if (!dshBin) dshBin = await installDsh(node, onEvent);
+  if (!dshBin || (dshBin === privateDshBin() && privateDshNeedsUpgrade())) dshBin = await installDsh(node, onEvent);
   emit('status', { message: '启动 DeepSeek Harness Web…' });
   return {
     command: `"${dshBin}" web --no-open --port ${PORT}`,
@@ -1304,6 +1358,7 @@ async function bootstrap(opts = {}) {
 module.exports = {
   PORT,
   APP_URL,
+  MIN_PRIVATE_DSH_VERSION,
   bootstrap,
   isServerUp,
   ensureDshupClientPlugin,
@@ -1316,6 +1371,9 @@ module.exports = {
   detectDshOnPath,
   detectDsh,
   privateDshBin,
+  privateDshVersion,
+  privateDshNeedsUpgrade,
+  prepareToStart,
   withRuntimePath,
   waitForServer,
   parseLaunchUrl,

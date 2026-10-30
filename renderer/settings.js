@@ -54,9 +54,21 @@
 
   function bindToggle(id, key) {
     const el = $(id);
-    el.addEventListener('change', () => {
-      dsh.settings.set(key, el.checked).catch(() => {});
+    el.addEventListener('change', async () => {
+      try {
+        const settings = await dsh.settings.set(key, el.checked);
+        if (key === 'autoStart') updateAutoStartStatus(settings.autoStart);
+      } catch (error) {
+        if (key === 'autoStart') {
+          el.checked = !el.checked;
+          $('autoStartStatus').textContent = '自启设置未保存：' + (error.message || error);
+        }
+      }
     });
+  }
+
+  function updateAutoStartStatus(enabled) {
+    $('autoStartStatus').textContent = enabled ? '已开启：登录系统后自动驻留托盘' : '未开启：登录系统后需要手动启动';
   }
 
   function bindSelect(id, key) {
@@ -69,6 +81,9 @@
   async function loadSystem() {
     const s = await dsh.settings.get();
     $('autoStartToggle').checked = !!s.autoStart;
+    updateAutoStartStatus(s.autoStart);
+    $('launchCommand').textContent = s.startup?.command || 'dshup';
+    $('settingsCommand').textContent = s.startup?.settingsCommand || 'dshup --settings';
     $('stopToggle').checked = !!s.stopDshOnQuit;
     $('trayToggle').checked = !!s.closeToTray;
     $('minToggle').checked = !!s.launchMinimized;

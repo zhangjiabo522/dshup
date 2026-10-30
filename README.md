@@ -2,16 +2,16 @@
 
 [项目仓库](https://github.com/zhangjiabo522/dshup) · [下载安装包](https://github.com/zhangjiabo522/dshup/releases)
 
-桌面客户端会检测 Node.js、pnpm 和 DeepSeek Harness，按需在用户私有目录安装依赖，然后在窗口内打开本机 `dsh web`。支持 Windows、macOS，以及 Ubuntu 22.04 / 24.04 的 amd64 桌面环境。Ubuntu 的安装包为 `.deb`，客户端版本为 1.0.3。
+桌面客户端会检测 Node.js、pnpm 和 DeepSeek Harness，按需在用户私有目录安装依赖，然后在窗口内打开本机 `dsh web`。支持 Windows、macOS，以及 Ubuntu 22.04 / 24.04 的 amd64 桌面环境。Ubuntu 的安装包为 `.deb`，客户端版本为 1.0.4。
 
 客户端提供托盘、开机自启、镜像与代理设置、语音输入、用量统计、数据目录管理和更新检查。内置 `dshup-client-settings` 插件把客户端设置与语音入口接入 Harness；标题栏齿轮和托盘菜单也可以打开客户端设置。
 
 ## Ubuntu 安装与升级
 
-在 Release 下载 `dshup-1.0.3-linux-amd64.deb`，在下载目录执行：
+在 Release 下载 `dshup-1.0.4-linux-amd64.deb`，在下载目录执行：
 
 ```bash
-sudo apt install ./dshup-1.0.3-linux-amd64.deb
+sudo apt install ./dshup-1.0.4-linux-amd64.deb
 ```
 
 `amd64` 表示 64 位 Intel / AMD 架构。安装后在应用列表打开 **DeepSeek Harness**，也可执行 `dshup`。应用程序安装到 `/opt/DeepSeek Harness/`，菜单入口为 `/usr/share/applications/dshup.desktop`。
@@ -39,11 +39,15 @@ Ubuntu 24.04 对用户命名空间的限制由 Electron Builder 的 `.deb` 安�
 
 `XDG_DATA_HOME` 和 `XDG_CONFIG_HOME` 应为绝对路径。开机自启只在系统设置中启用后写入，关闭开关会移除该条目；登录桌面后以后台模式启动 Harness。图形桌面会话必须继承你设置的环境变量，才能使用相同的自定义数据目录。
 
+自启成功后客户端常驻托盘，运行 `dshup` 可显示主窗口，运行 `dshup --settings` 可直接打开客户端设置。系统设置页显示当前自启状态和启动命令。启动失败时会打开错误页并提供重试，设置页仍可使用；普通启动日志保存在客户端数据目录的 `startup.log`，自启过程另记入 `autostart.log`。
+
 Windows 客户端数据位于 `%LOCALAPPDATA%\DeepSeekHarnessClient\`，macOS 位于 `~/Library/Application Support/DeepSeekHarnessClient/`。私有 Node.js 和 npm 包位于各平台客户端目录下的 `runtime/`。客户端不会写入系统 PATH 或修改 npm 全局包。
 
 ## Harness 0.2 认证与启动
 
-新安装运行时使用 `@deepseek-ai/dsh@0.2.1-rc.5`。可用的已有运行时或源码仓库仍可复用；客户端安装包升级和 Harness 运行时升级是两件事，不会因安装新 `.deb` 就强制覆盖已有运行时。
+从客户端 1.0.4 起，客户端管理的私有 Harness 运行时最低版本为 `@deepseek-ai/dsh@0.2.1-rc.5`。启动时直接读取私有包的版本信息；低于该版本时先显示升级状态，再通过已配置的 npm 源更新私有运行时，避免旧版无法读取新版凭据格式。相同或更新版本直接复用，不降级。缺少可识别版本信息的自定义启动入口仍按原方式使用。
+
+系统 PATH 中的 Harness 和已构建的源码仓库继续按原策略复用，客户端不会升级这些外部安装，也不会修改系统 PATH 或全局 npm 包。已在运行且可访问的服务仍直接复用，不会为升级终止它。升级安装包会保留用户设置、会话和插件；凭据文件不应手动删除版本字段或转换成旧格式。
 
 Harness 0.2 启动时提供带令牌的登录地址。官方服务在当前进程中允许多次兑换该启动令牌；客户端在引导时只兑换一次，将认证 cookie 写入内嵌浏览器，再加载不带令牌的地址。重试页面或打开设置时复用 cookie。客户端不会在普通日志中显示令牌值。
 
@@ -83,7 +87,7 @@ npx electron-builder --mac dmg zip --arm64 --publish never
 npx electron-builder --mac dmg zip --x64 --publish never
 ```
 
-产物位于 `release/`。Windows 保持 `dshup-Setup-1.0.3.exe` 的既有命名；macOS 文件名包含 `arm64` 或 `x64`，避免不同架构覆盖。`npm run package:win` 仍可生成免安装目录。
+产物位于 `release/`。Windows 保持 `dshup-Setup-1.0.4.exe` 的既有命名；macOS 文件名包含 `arm64` 或 `x64`，避免不同架构覆盖。`npm run package:win` 仍可生成免安装目录。
 
 ## 检查与持续集成
 

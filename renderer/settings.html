@@ -182,10 +182,17 @@
           <span class="hint">这些是 dshup 客户端行为，不是官方 dsh 网页设置</span>
         </div>
         <div class="panel-body">
+          <div class="banner">
+            <div class="label">启动入口</div>
+            <div>打开客户端：<code id="launchCommand">dshup</code></div>
+            <div>直接打开设置：<code id="settingsCommand">dshup --settings</code></div>
+            <div class="desc">也可以右键系统托盘中的 DeepSeek Harness 图标，选择“客户端设置”。</div>
+          </div>
           <div class="row">
             <div>
               <div class="label">开机自动启动</div>
-              <div class="desc">登录系统后自动在后台启动 DeepSeek Harness（打开客户端时无需等待）</div>
+              <div class="desc">登录系统后启动后台服务，客户端留在系统托盘；运行启动命令即可打开窗口。</div>
+              <div class="status" id="autoStartStatus">正在读取自启状态…</div>
             </div>
             <label class="switch"><input type="checkbox" id="autoStartToggle" /><span class="slider"></span></label>
           </div>

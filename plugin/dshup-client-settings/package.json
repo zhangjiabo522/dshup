@@ -1,7 +1,7 @@
 {
   "name": "dshup-client-settings",
   "description": "dshup desktop client settings and voice input, injected into official dsh settings dialog and composer",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "type": "module",
   "main": "lib/index.js",

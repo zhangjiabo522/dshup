@@ -72,6 +72,19 @@ function state(root, name) {
   return JSON.parse(fs.readFileSync(path.join(root, name), 'utf8'));
 }
 
+function privatePackage(api, version) {
+  const file = path.join(api.runtimeDir(), 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ name: '@deepseek-ai/dsh', version }));
+  return file;
+}
+
+function fakeNpm(api) {
+  const npm = path.join(api.runtimeDir(), 'node', 'bin', 'npm');
+  const fixture = path.join(__dirname, 'test', 'fixtures', 'fake-npm.cjs');
+  fs.writeFileSync(npm, `#!/usr/bin/env node\nrequire(${JSON.stringify(fixture)});\n`, { mode: 0o755 });
+}
+
 async function assertStopped(pid) {
   for (let i = 0; i < 30; i += 1) {
     try { process.kill(pid, 0); } catch (error) {
@@ -92,6 +105,88 @@ async function externalService(handler, verify) {
 }
 
 test('启动与认证在隔离目录和回环网络中验证', { skip: process.platform === 'win32' }, async (t) => {
+  await t.test('私有版本按数字预发布顺序判定，未知版本不触发安装', async () => {
+    await withFixture('unused', async ({ api }) => {
+      assert.equal(api.privateDshVersion(), null);
+      assert.equal(api.privateDshNeedsUpgrade(), false);
+      for (const [version, expected] of [
+        ['0.1.0-rc.6', true], ['0.2.1-alpha.10', true], ['0.2.1-rc.4', true],
+        ['0.2.1-rc.5', false], ['0.2.1-rc.5+local.1', false], ['0.2.1-rc.10', false],
+        ['0.2.1', false], ['0.2.2-alpha.1', false], ['1.0.0', false], ['custom', false],
+      ]) {
+        privatePackage(api, version);
+        assert.equal(api.privateDshVersion(), version);
+        assert.equal(api.privateDshNeedsUpgrade(), expected, version);
+      }
+    });
+  });
+  await t.test('旧私有运行时先经私有 npm 升级，再启动服务', async () => {
+    await withFixture('upgrade', async ({ api, root, start }) => {
+      privatePackage(api, '0.1.0-rc.6');
+      fakeNpm(api);
+      const events = [];
+      const result = await start({ onEvent: (event) => events.push(event.message) });
+      assert.equal(result.alreadyRunning, false);
+      assert.equal(api.privateDshVersion(), api.MIN_PRIVATE_DSH_VERSION);
+      assert.deepEqual(state(root, 'npm-install.json'), {
+        prefix: api.runtimeDir(), spec: `@deepseek-ai/dsh@${api.MIN_PRIVATE_DSH_VERSION}`, command: 'install',
+      });
+      assert.ok(events.some((message) => message.includes(`0.1.0-rc.6 → ${api.MIN_PRIVATE_DSH_VERSION}`)));
+      assert.ok(events.indexOf('客户端私有 DeepSeek Harness 已升级') < events.indexOf('启动 DeepSeek Harness Web…'));
+    });
+  });
+  for (const scenario of ['upgrade-fails', 'upgrade-stale']) {
+    await t.test(`升级未生效时不启动旧运行时：${scenario}`, async () => {
+      await withFixture(scenario, async ({ api, root, start }) => {
+        privatePackage(api, '0.1.0-rc.6');
+        fakeNpm(api);
+        await assert.rejects(start(), /私有运行时升级失败/);
+        assert.equal(api.privateDshVersion(), '0.1.0-rc.6');
+        assert.equal(fs.existsSync(path.join(root, 'starts.json')), false);
+      });
+    });
+  }
+  await t.test('达标与更高的私有版本不重复安装或降级', async () => {
+    await withFixture('unused', async ({ api, root }) => {
+      fakeNpm(api);
+      for (const version of [api.MIN_PRIVATE_DSH_VERSION, '0.2.1-rc.10', '0.2.1', '0.3.0']) {
+        privatePackage(api, version);
+        const plan = await api.prepareToStart();
+        assert.equal(plan.file, api.privateDshBin());
+        assert.equal(api.privateDshVersion(), version);
+        assert.equal(fs.existsSync(path.join(root, 'npm-install.json')), false);
+      }
+    });
+  });
+  await t.test('外部 PATH 运行时不会被私有版本策略升级', async () => {
+    await withFixture('unused', async ({ api, root, start }) => {
+      fakeNpm(api);
+      const external = path.join(root, 'external-bin');
+      fs.mkdirSync(external);
+      fs.renameSync(api.privateDshBin(), path.join(external, 'dsh'));
+      process.env.PATH = external;
+      await start();
+      assert.equal(api.detectDsh(), path.join(external, 'dsh'));
+      assert.equal(fs.existsSync(path.join(root, 'npm-install.json')), false);
+    });
+  });
+  await t.test('已构建源码优先时不会升级旁边的旧私有运行时', async () => {
+    await withFixture('unused', async ({ api, root }) => {
+      privatePackage(api, '0.1.0-rc.6');
+      fakeNpm(api);
+      const checkout = path.join(root, 'checkout');
+      fs.mkdirSync(path.join(checkout, 'apps', 'web', 'dist'), { recursive: true });
+      fs.mkdirSync(path.join(checkout, 'node_modules'));
+      fs.writeFileSync(path.join(checkout, 'package.json'), '{}');
+      fs.writeFileSync(path.join(checkout, 'apps', 'web', 'dist', 'index.html'), '<!doctype html>');
+      process.env.DSH_CHECKOUT = checkout;
+      const plan = await api.prepareToStart();
+      assert.equal(plan.cwd, checkout);
+      assert.ok(plan.args.includes('apps/cli/src/bin.ts'));
+      assert.equal(api.privateDshVersion(), '0.1.0-rc.6');
+      assert.equal(fs.existsSync(path.join(root, 'npm-install.json')), false);
+    });
+  });
   await t.test('XDG 数据目录只接受绝对路径', { skip: process.platform !== 'linux' }, async () => {
     await withFixture('unused', async ({ api, root }) => {
       const fallback = path.join(process.env.HOME, '.local', 'share', 'DeepSeekHarnessClient');

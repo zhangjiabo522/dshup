@@ -308,14 +308,20 @@ function setAutoStartReg(enable) {
 }
 
 const SMOKE = process.argv.includes('--smoke-test'); // 无人工验证模式：加载成功即退出
-const AUTO_START = process.argv.includes('--autostart'); // 开机自启后台模式：拉起 dsh 后自动退出，不弹窗
+const AUTO_START = process.argv.includes('--autostart');
 
 let win = null;
 let bootResult = null; // { url, alreadyRunning, process, stop }
 let booting = false;
 let userOpened = false; // 自启模式下用户是否主动打开过窗口
+let settingsRequested = process.argv.includes('--settings');
 let quitting = false; // 真正退出（托盘退出按钮置位，避免 closeToTray 拦截）
 let tray = null; // 系统托盘图标（常驻：关闭到托盘后从托盘恢复）
+let lastBootError = '';
+let bootHistory = [];
+let bootLogStream = null;
+let pageLoadSerial = 0;
+let fatalRecovery = null;
 
 // 自启模式日志（便于排查）
 function autoLog(line) {
@@ -334,22 +340,11 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
-    // 自启后台实例收到用户主动打开 → 创建/显示窗口，走正常流程
-    userOpened = true;
-    if (!win || win.isDestroyed()) {
-      createWindow();
-    } else {
-      if (win.isMinimized()) win.restore();
-      win.show();
-      win.focus();
-    }
-    if (bootResult && win && !win.isDestroyed()) {
-      setTimeout(() => {
-        if (win && !win.isDestroyed()) loadDshPage(12);
-      }, 300);
-    }
-  });
+  app.on('second-instance', handleSecondInstance);
+}
+
+function handleSecondInstance(_event, commandLine = []) {
+  showWindow(commandLine.includes('--settings'));
 }
 
 // 首次正常启动（打包版）时注册开机自启：Windows 写 HKCU Run 键 / macOS 用 launchd（Electron API）
@@ -374,9 +369,41 @@ function ensureAutoStart() {
 }
 
 function send(type, payload) {
-  if (win && !win.isDestroyed()) {
-    win.webContents.send('boot-event', { type, ...(payload || {}) });
+  const event = { type, ...(payload || {}) };
+  if (['phase', 'status', 'progress', 'server', 'log', 'error', 'fatal'].includes(type)) {
+    if (type === 'phase' && payload?.message === 'checking') bootHistory = [];
+    bootHistory.push(event);
+    if (bootHistory.length > 400) bootHistory.shift();
+    if (event.message && type !== 'progress') {
+      try {
+        if (!bootLogStream) {
+          fs.mkdirSync(clientBaseDir(), { recursive: true });
+          const file = path.join(clientBaseDir(), 'startup.log');
+          if (fs.existsSync(file) && fs.statSync(file).size > 2 * 1024 * 1024) fs.renameSync(file, file + '.1');
+          bootLogStream = fs.createWriteStream(file, { flags: 'a', mode: 0o600 });
+          bootLogStream.on('error', () => { bootLogStream = null; });
+        }
+        const line = String(event.message).replace(/([?&]token=)[^\s\x1b]+/g, '$1[已隐藏]');
+        bootLogStream.write(`[${new Date().toISOString()}] ${type}: ${line}\n`);
+      } catch {}
+    }
   }
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('boot-event', event);
+  }
+}
+
+async function showStartupFailure(error) {
+  lastBootError = error?.message || String(error || '服务未能正常启动，请查看日志后重试。');
+  clearTimeout(renderRetryTimer);
+  pageLoadSerial += 1;
+  send('fatal', { message: lastBootError });
+  if (!win || win.isDestroyed() || settingsRequested) return;
+  if (win.webContents.getURL() === require('url').pathToFileURL(SPLASH).href) return;
+  if (!fatalRecovery) {
+    fatalRecovery = win.loadFile(SPLASH).catch(() => {}).finally(() => { fatalRecovery = null; });
+  }
+  await fatalRecovery;
 }
 
 function createWindow() {
@@ -396,7 +423,7 @@ function createWindow() {
       sandbox: false,
     },
   });
-  win.loadFile(SPLASH);
+  win.loadFile(settingsRequested ? SETTINGS_PAGE : SPLASH);
 
   // Ctrl+, 打开 dshup 客户端设置页（不是官方 dsh 网页设置）
   win.webContents.on('before-input-event', (event, input) => {
@@ -404,6 +431,7 @@ function createWindow() {
     const comma = input.key === ',' || input.code === 'Comma';
     if (comma && (input.control || input.meta) && !input.alt && !input.shift) {
       event.preventDefault();
+      settingsRequested = true;
       if (win && !win.isDestroyed()) win.loadFile(SETTINGS_PAGE);
     }
   });
@@ -411,6 +439,9 @@ function createWindow() {
   // 页面缩放保持用户可控：Ctrl+滚轮 / Ctrl+加号减号 等比缩放（长页面可缩小后完整显示），Ctrl+0 复位
   // 不做任何锁定；每次加载新页面时复位到 100%，避免残留缩放
   win.webContents.on('did-finish-load', () => {
+    if (win.webContents.getURL() === require('url').pathToFileURL(SPLASH).href) {
+      for (const event of bootHistory) win.webContents.send('boot-event', event);
+    }
     try {
       if (win.webContents.getZoomFactor() !== 1) win.webContents.setZoomFactor(1);
     } catch (e) {
@@ -432,7 +463,7 @@ function createWindow() {
   });
 
   // 启动后自动最小化
-  if (readClientSettings().launchMinimized && !SMOKE) {
+  if (readClientSettings().launchMinimized && !SMOKE && !settingsRequested) {
     win.once('ready-to-show', () => {
       try { win.minimize(); } catch (err) { /* ignore */ }
     });
@@ -954,14 +985,16 @@ function createWindow() {
   win.webContents.on('will-redirect', guardNavigation);
 
   // dsh 服务意外挂掉时，切回启动页并提示重试
-  win.webContents.on('did-fail-load', (_e, code, desc, url) => {
+  win.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
     if (code === -3 /* ERR_ABORTED */) return;
     if (url.startsWith('http://127.0.0.1:') || url.startsWith('http://localhost:')) {
       if (SMOKE) {
         console.error('[smoke] FAILED to load ' + url + ': ' + desc);
         app.exit(1);
       }
-      send('fatal', { message: '页面加载失败（' + desc + '），可能 dsh 服务已停止。点击"重试"重新检测并启动。' });
+      if (isMainFrame !== false && !settingsRequested) {
+        void showStartupFailure('无法连接本地服务（' + desc + '）。服务可能已经退出，请查看日志并重试。');
+      }
     }
   });
 
@@ -990,12 +1023,15 @@ function createWindow() {
 }
 
 async function runBootstrap() {
-  if (booting) return;
+  if (booting) return false;
   booting = true;
+  lastBootError = '';
   try {
     // 若上次由本客户端启动的服务还活着，先停掉，避免重复实例
     if (bootResult && bootResult.stop && !bootResult.alreadyRunning) {
-      await bootResult.stop();
+      const previous = bootResult;
+      bootResult = null;
+      await previous.stop();
     }
     send('phase', { message: 'checking' });
     const authCookies = await require('electron').session.defaultSession.cookies.get({ url: APP_URL });
@@ -1010,19 +1046,38 @@ async function runBootstrap() {
     });
     // dsh >= 0.2：写入认证 cookie，保证内嵌窗口与 iframe/api 请求都通过认证
     if (!bootResult.alreadyRunning) await installAuthCookies(bootResult.cookies);
+    await require('electron').session.defaultSession.cookies.flushStore();
+    const running = bootResult;
+    if (running.process) {
+      const stopped = (code, signal) => {
+        if (quitting || SMOKE || bootResult !== running) return;
+        bootResult = null;
+        void showStartupFailure(`本地服务已退出（${signal || code}），请查看日志并重试。`);
+      };
+      running.process.once('exit', stopped);
+      if (running.process.exitCode !== null || running.process.signalCode !== null) {
+        stopped(running.process.exitCode, running.process.signalCode);
+        return false;
+      }
+    }
     // 等待页面首次渲染稳定后再切到内嵌页面
     setTimeout(() => {
-      if (win && !win.isDestroyed()) {
+      if (win && !win.isDestroyed() && !settingsRequested && bootResult === running) {
         loadDshPage(12);
       }
     }, 500);
+    return true;
   } catch (e) {
-    send('fatal', { message: e.message || String(e) });
+    const failed = bootResult;
+    bootResult = null;
+    if (failed && !failed.alreadyRunning) await failed.stop().catch(() => {});
+    await showStartupFailure(e);
     if (AUTO_START) autoLog('启动失败: ' + (e.message || e));
     if (SMOKE) {
       console.error('[smoke] BOOTSTRAP FAILED: ' + (e.message || e));
       app.exit(1);
     }
+    return false;
   } finally {
     booting = false;
   }
@@ -1071,40 +1126,48 @@ async function installAuthCookies(cookies) {
   }
 }
 
-function loadDshPage(retriesLeft) {
-  if (!win || win.isDestroyed()) return;
-  const url = bootResult ? bootResult.url : APP_URL;
-  // 0.2.x 首次进入必须用带 token 的地址（消费一次即种下 cookie 并跳回干净地址）
-  const firstUrl = bootResult && !bootResult.cookies?.length && bootResult.launchUrl ? bootResult.launchUrl : url;
-  if (bootResult && bootResult.launchUrl) bootResult.launchUrl = null; // token 只能消费一次
-  win.loadURL(firstUrl).catch(() => { /* ignore */ });
+function loadDshPage(retriesLeft = 12) {
+  if (!win || win.isDestroyed() || settingsRequested) return;
+  if (!bootResult) {
+    void showStartupFailure(lastBootError || '本地服务尚未启动，请点击重试。');
+    return;
+  }
+  const serial = ++pageLoadSerial;
+  const url = bootResult.url;
   clearTimeout(renderRetryTimer);
-  renderRetryTimer = setTimeout(async () => {
-    if (!win || win.isDestroyed()) return;
-    const current = win.webContents.getURL();
-    // 完成认证后地址会变成不带 token 的干净地址，两者都视为"仍在我们自己的页面"
-    if (current !== url && current !== firstUrl && !current.startsWith('http://127.0.0.1:')) return;
-    const rendered = await win.webContents
-      .executeJavaScript(
-        `(() => {
-          const buttons = document.querySelectorAll('button').length;
-          const textLen = document.body ? (document.body.textContent || '').trim().length : 0;
-          return buttons > 3 && textLen > 20 && !document.body.textContent.trim().startsWith('dsh web authentication required');
-        })()`
-      )
-      .catch(() => false);
-    if (rendered === true) return;
-    if (retriesLeft > 0) {
-      send('status', { message: '页面尚未就绪，自动重试中…' });
-      loadDshPage(retriesLeft - 1);
-    } else {
-      send('fatal', { message: '页面多次加载仍未就绪，请重启客户端，或检查 dsh 服务日志。' });
+  win.loadURL(url).then(() => {
+    if (serial !== pageLoadSerial || !win || win.isDestroyed() || settingsRequested) return;
+    renderRetryTimer = setTimeout(async () => {
+      if (serial !== pageLoadSerial || !win || win.isDestroyed() || settingsRequested) return;
+      const rendered = await win.webContents.executeJavaScript(`(() => {
+        const body = document.body?.cloneNode(true);
+        if (!body) return false;
+        body.querySelectorAll('#dsh-win-titlebar, script, style').forEach(node => node.remove());
+        const text = (body.textContent || '').trim();
+        if (/Failed to load plugins/i.test(text)) return 'plugins';
+        return body.querySelectorAll('button').length > 3 && text.length > 20 && !text.startsWith('dsh web authentication required');
+      })()`).catch(() => false);
+      if (serial !== pageLoadSerial || settingsRequested) return;
+      if (rendered === true) return;
+      if (rendered === 'plugins') {
+        await showStartupFailure('插件加载失败，请在客户端设置中检查插件，修复后点击重试。');
+      } else if (retriesLeft > 0) {
+        send('status', { message: '页面尚未就绪，自动重试中…' });
+        loadDshPage(retriesLeft - 1);
+      } else {
+        await showStartupFailure('页面多次加载仍未就绪，请查看启动日志并重试。');
+      }
+    }, 2500);
+  }).catch(error => {
+    if (serial === pageLoadSerial && !settingsRequested) {
+      void showStartupFailure('无法打开本地服务：' + (error.message || error));
     }
-  }, 2500);
+  });
 }
 
 // IPC
 ipcMain.on('retry-bootstrap', () => {
+  settingsRequested = false;
   if (win && !win.isDestroyed()) win.loadFile(SPLASH);
   setTimeout(() => runBootstrap(), 300);
 });
@@ -1137,13 +1200,12 @@ ipcMain.handle('open-external', (_e, url) => {
 
 // 设置页导航
 ipcMain.handle('open-settings', () => {
+  settingsRequested = true;
   if (win && !win.isDestroyed()) win.loadFile(SETTINGS_PAGE);
 });
 ipcMain.handle('close-settings', () => {
-  if (win && !win.isDestroyed()) {
-    const url = bootResult ? bootResult.url : APP_URL;
-    win.loadURL(url);
-  }
+  settingsRequested = false;
+  loadDshPage(12);
 });
 
 // 设置页"网页设置"tab：对 iframe 里的 dsh 页面自动打开原设置面板
@@ -1160,7 +1222,11 @@ ipcMain.handle('auto-open-settings-panel', async () => {
 });
 
 // 客户端本地设置
-ipcMain.handle('settings:get', () => readClientSettings());
+ipcMain.handle('settings:get', () => {
+  const command = app.isPackaged && process.platform === 'linux' ? 'dshup' :
+    `"${process.execPath}"${app.isPackaged ? '' : ` "${app.getAppPath()}"`}`;
+  return { ...readClientSettings(), startup: { command, settingsCommand: command + ' --settings' } };
+});
 ipcMain.handle('settings:set', (_e, key, value) => {
   const next = writeClientSettings({ [key]: value });
   if (key === 'autoStart') {
@@ -1213,13 +1279,22 @@ ipcMain.handle('settings:import', async () => {
 // ---------------- 系统托盘 ----------------
 
 /** 显示/恢复主窗口（窗口被关掉后按启动流程重建）。 */
-function showWindow() {
+function showWindow(openSettings = false) {
+  userOpened = true;
+  settingsRequested = openSettings;
   if (!win || win.isDestroyed()) {
     createWindow();
-    return;
   }
+  if (win.isMinimized()) win.restore();
   win.show();
   win.focus();
+  if (settingsRequested) {
+    void win.loadFile(SETTINGS_PAGE);
+  } else if (bootResult) {
+    setTimeout(() => {
+      if (win && !win.isDestroyed() && !settingsRequested) loadDshPage(12);
+    }, 300);
+  }
 }
 
 /** 创建常驻托盘图标：左键双击显示窗口，菜单含显示/退出。 */
@@ -1233,10 +1308,7 @@ function createTray() {
       { label: '显示 DeepSeek Harness', click: () => { showWindow(); } },
       {
         label: '客户端设置',
-        click: () => {
-          showWindow();
-          if (win && !win.isDestroyed()) win.loadFile(SETTINGS_PAGE);
-        },
+        click: () => { showWindow(true); },
       },
       { type: 'separator' },
       {
@@ -1971,6 +2043,10 @@ function autoOpenSettingsPanel(frame) {
 }
 
 ipcMain.on('open-in-browser', async () => {
+  if (!bootResult) {
+    await showStartupFailure(lastBootError || '本地服务尚未启动，请先点击重试。');
+    return;
+  }
   const url = bootResult ? bootResult.url : APP_URL;
   if (bootResult?.browserUrl) {
     await shell.openExternal(bootResult.browserUrl);
@@ -1985,6 +2061,29 @@ ipcMain.on('open-in-browser', async () => {
     });
   }
 });
+
+async function startBackgroundClient() {
+  createTray();
+  autoLog('自启模式启动');
+  const success = await runBootstrap();
+  if (success) {
+    autoLog('dsh 已就绪，客户端保持后台运行');
+    if (!tray && !userOpened) showWindow();
+    return true;
+  }
+  autoLog('后台服务启动失败，打开启动页供重试');
+  userOpened = true;
+  if (settingsRequested) {
+    showWindow(true);
+    return false;
+  }
+  if (!win || win.isDestroyed()) createWindow();
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  await showStartupFailure(lastBootError);
+  return false;
+}
 
 // 生命周期
 app.whenReady().then(() => {
@@ -2009,15 +2108,10 @@ app.whenReady().then(() => {
     console.error('[voice] 权限处理器设置失败:', e.message);
   }
 
-  if (AUTO_START) {
-    // 开机自启后台模式：不弹窗，拉起 dsh 后自动退出（不停止 dsh）
-    autoLog('自启模式启动');
-    runBootstrap().then(() => {
-      if (!userOpened) {
-        autoLog('dsh 已就绪，后台任务退出');
-        // 多等 8 秒缓冲：让 dsh 后端完全初始化，用户随后打开时页面直接可用（防黑屏）
-        setTimeout(() => app.exit(0), 8000);
-      }
+  if (AUTO_START && !settingsRequested) {
+    void startBackgroundClient().catch((error) => {
+      autoLog('无法启动后台客户端: ' + (error.message || error));
+      app.exit(1);
     });
     return;
   }
